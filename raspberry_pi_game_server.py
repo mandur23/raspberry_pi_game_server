@@ -37,6 +37,12 @@ stats = {
     "server_start_time": datetime.now()
 }
 
+# 최근 수신된 데이터 (HTML 표시용)
+recent_data = {
+    "last_joystick": None,  # {"x": 0.5, "y": 0.5, "keys": ["up"], "time": datetime}
+    "last_button": None      # {"button": "A", "pressed": True, "key": "space", "time": datetime}
+}
+
 # 접속자 정보 추적
 connected_users = {}  # {ip: {"first_seen": datetime, "last_seen": datetime, "request_count": int}}
 
@@ -375,6 +381,22 @@ def dashboard():
             </div>
         </div>
         
+        <div class="dashboard" style="margin-bottom: 30px;">
+            <div class="card">
+                <h2>📡 최근 조이스틱 입력</h2>
+                <div id="recent-joystick" style="padding: 15px;">
+                    <div class="no-users">데이터 없음</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>🔘 최근 버튼 입력</h2>
+                <div id="recent-button" style="padding: 15px;">
+                    <div class="no-users">데이터 없음</div>
+                </div>
+            </div>
+        </div>
+        
         <div class="users-list">
             <h2>👥 접속자 목록</h2>
             <div id="users-container">
@@ -450,6 +472,48 @@ def dashboard():
                     : '<span class="status-badge status-inactive">비활성</span>';
                 document.getElementById('button-status').innerHTML = btnStatus;
                 
+                // 최근 수신 데이터 표시
+                const recentJoystick = document.getElementById('recent-joystick');
+                if (statusData.recent_data && statusData.recent_data.joystick) {
+                    const js = statusData.recent_data.joystick;
+                    const keysDisplay = js.keys && js.keys.length > 0 
+                        ? js.keys.join(', ') 
+                        : '없음 (중앙)';
+                    recentJoystick.innerHTML = `
+                        <div style="line-height: 1.8;">
+                            <div><strong>X:</strong> ${js.x}</div>
+                            <div><strong>Y:</strong> ${js.y}</div>
+                            ${js.strength !== undefined ? `<div><strong>강도:</strong> ${js.strength}%</div>` : ''}
+                            <div><strong>입력된 키:</strong> ${keysDisplay}</div>
+                            <div style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                                ${formatTime(js.time)}
+                            </div>
+                        </div>
+                    `;
+                } else {
+                    recentJoystick.innerHTML = '<div class="no-users">데이터 없음</div>';
+                }
+                
+                const recentButton = document.getElementById('recent-button');
+                if (statusData.recent_data && statusData.recent_data.button) {
+                    const btn = statusData.recent_data.button;
+                    const actionBadge = btn.pressed 
+                        ? '<span class="status-badge status-active">눌림</span>'
+                        : '<span class="status-badge status-inactive">떼어짐</span>';
+                    recentButton.innerHTML = `
+                        <div style="line-height: 1.8;">
+                            <div><strong>버튼:</strong> ${btn.button}</div>
+                            <div><strong>상태:</strong> ${actionBadge}</div>
+                            <div><strong>키보드 키:</strong> ${btn.key}</div>
+                            <div style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                                ${formatTime(btn.time)}
+                            </div>
+                        </div>
+                    `;
+                } else {
+                    recentButton.innerHTML = '<div class="no-users">데이터 없음</div>';
+                }
+                
                 // 접속자 목록 업데이트
                 const container = document.getElementById('users-container');
                 if (usersData.users && usersData.users.length > 0) {
@@ -481,9 +545,9 @@ def dashboard():
             });
         }
         
-        // 초기 로드 및 자동 새로고침 (5초마다)
+        // 초기 로드 및 자동 새로고침 (1초마다)
         loadData();
-        setInterval(loadData, 5000);
+        setInterval(loadData, 1000);
     </script>
 </body>
 </html>
@@ -569,6 +633,10 @@ def get_status():
                 "is_active": button_active
             }
         },
+        "recent_data": {
+            "joystick": recent_data["last_joystick"],
+            "button": recent_data["last_button"]
+        },
         "summary": {
             "receiving_data": joystick_active or button_active,
             "message": "데이터 수신 중" if (joystick_active or button_active) else "데이터 수신 대기 중"
@@ -602,7 +670,8 @@ def receive_joystick():
         
         # 통계 업데이트
         stats["joystick_count"] += 1
-        stats["last_joystick_time"] = datetime.now()
+        now = datetime.now()
+        stats["last_joystick_time"] = now
         
         # 이전에 눌려있던 키 모두 떼기
         release_all_keys()
@@ -610,6 +679,13 @@ def receive_joystick():
         # 임계값 이상일 때만 키 입력
         if abs(x) < JOYSTICK_THRESHOLD and abs(y) < JOYSTICK_THRESHOLD:
             # 조이스틱이 중앙에 있으면 모든 키 떼기
+            keys_to_press = []
+            recent_data["last_joystick"] = {
+                "x": round(x, 2),
+                "y": round(y, 2),
+                "keys": [],
+                "time": now.isoformat()
+            }
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [Joystick] ✓ 데이터 수신됨 (중앙 위치) - 총 {stats['joystick_count']}회")
             return jsonify({"status": "ok", "keys": "none"})
         
@@ -637,6 +713,15 @@ def receive_joystick():
         
         # 대각선 이동 (동시에 여러 키 누르기)
         # 이미 위에서 처리됨
+        
+        # 최근 데이터 저장
+        recent_data["last_joystick"] = {
+            "x": round(x, 2),
+            "y": round(y, 2),
+            "strength": strength,
+            "keys": keys_to_press,
+            "time": now.isoformat()
+        }
         
         print(f"[{datetime.now().strftime('%H:%M:%S')}] [Joystick] ✓ 데이터 수신됨 - "
               f"X: {x:.2f}, Y: {y:.2f} → Keys: {keys_to_press} (총 {stats['joystick_count']}회)")
@@ -670,7 +755,8 @@ def receive_button():
         
         # 통계 업데이트
         stats["button_count"] += 1
-        stats["last_button_time"] = datetime.now()
+        now = datetime.now()
+        stats["last_button_time"] = now
         
         if button not in KEY_MAPPING:
             return jsonify({"status": "error", "message": f"Unknown button: {button}"}), 400
@@ -684,6 +770,15 @@ def receive_button():
         else:
             release_key(key)
             pressed_keys.discard(button)
+        
+        # 최근 데이터 저장
+        recent_data["last_button"] = {
+            "button": button,
+            "pressed": pressed,
+            "action": action,
+            "key": str(key),
+            "time": now.isoformat()
+        }
         
         print(f"[{datetime.now().strftime('%H:%M:%S')}] [Button] ✓ 데이터 수신됨 - "
               f"{button} {action} → Key: {key} (총 {stats['button_count']}회)")
