@@ -1,0 +1,5 @@
+flask>=2.0.0
+flask-cors>=3.0.0
+pynput>=1.7.0
+paho-mqtt>=1.6.0
+
