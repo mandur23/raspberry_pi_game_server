@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>게임 서버 대시보드</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: white;
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 2.5em;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        .dashboard {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .card {
+            background: white;
+            border-radius: 15px;
+            padding: 25px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            transition: transform 0.3s;
+        }
+        .card:hover {
+            transform: translateY(-5px);
+        }
+        .card h2 {
+            color: #667eea;
+            margin-bottom: 15px;
+            font-size: 1.5em;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+        }
+        .stat-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 10px 0;
+            border-bottom: 1px solid #eee;
+        }
+        .stat-item:last-child {
+            border-bottom: none;
+        }
+        .stat-label {
+            color: #666;
+            font-weight: 500;
+        }
+        .stat-value {
+            color: #333;
+            font-weight: bold;
+            font-size: 1.1em;
+        }
+        .status-badge {
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.9em;
+            font-weight: bold;
+        }
+        .status-active {
+            background: #4caf50;
+            color: white;
+        }
+        .status-inactive {
+            background: #f44336;
+            color: white;
+        }
+        .users-list {
+            background: white;
+            border-radius: 15px;
+            padding: 25px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        .users-list h2 {
+            color: #667eea;
+            margin-bottom: 20px;
+            font-size: 1.5em;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+        }
+        .user-item {
+            background: #f5f5f5;
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .user-info {
+            flex: 1;
+        }
+        .user-ip {
+            font-weight: bold;
+            color: #333;
+            font-size: 1.1em;
+            margin-bottom: 5px;
+        }
+        .user-details {
+            color: #666;
+            font-size: 0.9em;
+        }
+        .no-users {
+            text-align: center;
+            color: #999;
+            padding: 40px;
+            font-style: italic;
+        }
+        .last-update {
+            text-align: center;
+            color: white;
+            margin-top: 20px;
+            font-size: 0.9em;
+            opacity: 0.8;
+        }
+        .refresh-btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 1em;
+            margin-top: 10px;
+            transition: background 0.3s;
+        }
+        .refresh-btn:hover {
+            background: #5568d3;
+        }
+        .ip-link {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: bold;
+        }
+        .ip-link:hover {
+            text-decoration: underline;
+        }
+        .server-info {
+            background: rgba(255,255,255,0.1);
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 20px;
+            color: white;
+        }
+        .server-info h3 {
+            margin-bottom: 10px;
+            font-size: 1.1em;
+        }
+        .server-info p {
+            margin: 5px 0;
+            font-size: 0.95em;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎮 게임 서버 대시보드</h1>
+        
+        <div class="server-info">
+            <h3>📡 서버 접속 정보</h3>
+            <p><strong>로컬 접속:</strong> {{ local_link_html|safe }}</p>
+            <p id="network-access"><strong>내부망 접속:</strong> <span id="network-ips">{{ ip_links_html|safe }}</span></p>
+            <p style="font-size: 0.85em; opacity: 0.9; margin-top: 10px;">
+                💡 같은 Wi-Fi/네트워크에 연결된 다른 기기에서 위의 IP 주소로 접속하세요
+            </p>
+        </div>
+        
+        <div class="dashboard">
+            <div class="card">
+                <h2>📊 서버 상태</h2>
+                <div class="stat-item">
+                    <span class="stat-label">서버 IP 주소:</span>
+                    <span class="stat-value" id="server-ip" style="font-size: 0.9em; word-break: break-all;">{{ ip_list_text }}</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">서버 실행 시간:</span>
+                    <span class="stat-value" id="server-uptime">-</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">현재 시간:</span>
+                    <span class="stat-value" id="current-time">-</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">데이터 수신 상태:</span>
+                    <span class="stat-value" id="data-status">-</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>🕹️ 조이스틱 통계</h2>
+                <div class="stat-item">
+                    <span class="stat-label">총 수신 횟수:</span>
+                    <span class="stat-value" id="joystick-count">0</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">마지막 수신:</span>
+                    <span class="stat-value" id="joystick-last">-</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">상태:</span>
+                    <span class="stat-value" id="joystick-status">-</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>🔘 버튼 통계</h2>
+                <div class="stat-item">
+                    <span class="stat-label">총 수신 횟수:</span>
+                    <span class="stat-value" id="button-count">0</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">마지막 수신:</span>
+                    <span class="stat-value" id="button-last">-</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">상태:</span>
+                    <span class="stat-value" id="button-status">-</span>
+                </div>
+            </div>
+        </div>
+        
+        <div class="dashboard" style="margin-bottom: 30px;">
+            <div class="card">
+                <h2>📡 최근 조이스틱 입력</h2>
+                <div id="recent-joystick" style="padding: 15px;">
+                    <div class="no-users">데이터 없음</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>🔘 최근 버튼 입력</h2>
+                <div id="recent-button" style="padding: 15px;">
+                    <div class="no-users">데이터 없음</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="users-list">
+            <h2>👥 접속자 목록</h2>
+            <div id="users-container">
+                <div class="no-users">접속자 정보를 불러오는 중...</div>
+            </div>
+            <button class="refresh-btn" onclick="loadData()">새로고침</button>
+        </div>
+        
+        <div class="last-update">
+            마지막 업데이트: <span id="last-update">-</span>
+        </div>
+    </div>
+    
+    <script>
+        function formatTime(dateStr) {
+            if (!dateStr) return '-';
+            const date = new Date(dateStr);
+            return date.toLocaleString('ko-KR');
+        }
+        
+        function formatElapsed(seconds) {
+            if (seconds === null || seconds === undefined) return '-';
+            if (seconds < 60) return seconds.toFixed(1) + '초 전';
+            if (seconds < 3600) return Math.floor(seconds / 60) + '분 전';
+            return Math.floor(seconds / 3600) + '시간 전';
+        }
+        
+        function formatUptime(startTime) {
+            const start = new Date(startTime);
+            const now = new Date();
+            const diff = Math.floor((now - start) / 1000);
+            const hours = Math.floor(diff / 3600);
+            const minutes = Math.floor((diff % 3600) / 60);
+            const seconds = diff % 60;
+            return `${hours}시간 ${minutes}분 ${seconds}초`;
+        }
+        
+        function loadData() {
+            // 병렬로 API 호출 (성능 최적화)
+            Promise.all([
+                fetch('/status').then(r => r.json()),
+                fetch('/users').then(r => r.json())
+            ]).then(([statusData, usersData]) => {
+                // 서버 상태 업데이트
+                document.getElementById('server-uptime').textContent = 
+                    formatUptime(statusData.server_start_time);
+                document.getElementById('current-time').textContent = 
+                    formatTime(statusData.current_time);
+                
+                const receiving = statusData.summary.receiving_data;
+                const statusBadge = receiving 
+                    ? '<span class="status-badge status-active">수신 중</span>'
+                    : '<span class="status-badge status-inactive">대기 중</span>';
+                document.getElementById('data-status').innerHTML = statusBadge;
+                
+                // 조이스틱 통계
+                const js = statusData.statistics.joystick;
+                document.getElementById('joystick-count').textContent = js.total_received;
+                document.getElementById('joystick-last').textContent = 
+                    js.last_received ? formatTime(js.last_received) : '없음';
+                const jsStatus = js.is_active 
+                    ? '<span class="status-badge status-active">활성</span>'
+                    : '<span class="status-badge status-inactive">비활성</span>';
+                document.getElementById('joystick-status').innerHTML = jsStatus;
+                
+                // 버튼 통계
+                const btn = statusData.statistics.button;
+                document.getElementById('button-count').textContent = btn.total_received;
+                document.getElementById('button-last').textContent = 
+                    btn.last_received ? formatTime(btn.last_received) : '없음';
+                const btnStatus = btn.is_active 
+                    ? '<span class="status-badge status-active">활성</span>'
+                    : '<span class="status-badge status-inactive">비활성</span>';
+                document.getElementById('button-status').innerHTML = btnStatus;
+                
+                // 최근 수신 데이터 표시
+                const recentJoystick = document.getElementById('recent-joystick');
+                if (statusData.recent_data && statusData.recent_data.joystick) {
+                    const js = statusData.recent_data.joystick;
+                    const keysDisplay = js.keys && js.keys.length > 0 
+                        ? js.keys.join(', ') 
+                        : '없음 (중앙)';
+                    recentJoystick.innerHTML = `
+                        <div style="line-height: 1.8;">
+                            <div><strong>X:</strong> ${js.x}</div>
+                            <div><strong>Y:</strong> ${js.y}</div>
+                            ${js.strength !== undefined ? `<div><strong>강도:</strong> ${js.strength}%</div>` : ''}
+                            <div><strong>입력된 키:</strong> ${keysDisplay}</div>
+                            <div style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                                ${formatTime(js.time)}
+                            </div>
+                        </div>
+                    `;
+                } else {
+                    recentJoystick.innerHTML = '<div class="no-users">데이터 없음</div>';
+                }
+                
+                const recentButton = document.getElementById('recent-button');
+                if (statusData.recent_data && statusData.recent_data.button) {
+                    const btn = statusData.recent_data.button;
+                    const actionBadge = btn.pressed 
+                        ? '<span class="status-badge status-active">눌림</span>'
+                        : '<span class="status-badge status-inactive">떼어짐</span>';
+                    recentButton.innerHTML = `
+                        <div style="line-height: 1.8;">
+                            <div><strong>버튼:</strong> ${btn.button}</div>
+                            <div><strong>상태:</strong> ${actionBadge}</div>
+                            <div><strong>키보드 키:</strong> ${btn.key}</div>
+                            <div style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                                ${formatTime(btn.time)}
+                            </div>
+                        </div>
+                    `;
+                } else {
+                    recentButton.innerHTML = '<div class="no-users">데이터 없음</div>';
+                }
+                
+                // 접속자 목록 업데이트
+                const container = document.getElementById('users-container');
+                if (usersData.users && usersData.users.length > 0) {
+                    container.innerHTML = usersData.users.map(user => {
+                        const firstSeen = formatTime(user.first_seen);
+                        const lastSeen = formatTime(user.last_seen);
+                        const elapsed = formatElapsed(user.elapsed_seconds);
+                        
+                        return `
+                            <div class="user-item">
+                                <div class="user-info">
+                                    <div class="user-ip">${user.ip}</div>
+                                    <div class="user-details">
+                                        첫 접속: ${firstSeen}<br>
+                                        마지막 활동: ${lastSeen} (${elapsed})<br>
+                                        요청 횟수: ${user.request_count}회
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    }).join('');
+                } else {
+                    container.innerHTML = '<div class="no-users">접속자가 없습니다</div>';
+                }
+                
+                document.getElementById('last-update').textContent = new Date().toLocaleString('ko-KR');
+            }).catch(error => {
+                console.error('Error:', error);
+            });
+        }
+        
+        // 초기 로드 및 자동 새로고침 (최적화: 200ms 간격으로 끊김 최소화)
+        loadData();
+        setInterval(loadData, 200);
+    </script>
+</body>
+</html>
+

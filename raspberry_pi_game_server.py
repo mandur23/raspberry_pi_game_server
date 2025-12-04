@@ -17,7 +17,7 @@ import threading
 import time
 from datetime import datetime
 
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 from pynput.keyboard import Key, Controller
 
@@ -29,9 +29,14 @@ app.config["SERVER_PORT"] = Port
 # 키보드 컨트롤러
 keyboard = Controller()
 
+# 키 입력 동기화를 위한 Lock (끊김 방지)
+keyboard_lock = threading.Lock()
+
 # 현재 눌려있는 키 추적 (중복 입력 방지)
 pressed_keys = set()  # 버튼 이름 추적 ("A", "B", "X", "Y")
 pressed_keyboard_keys = set()  # 실제 키보드 키 추적 (Key.up, Key.down, 'w', 'a' 등)
+pressed_button_keys = set()  # 버튼으로 눌린 키 추적 (조이스틱과 분리)
+pressed_joystick_keys = set()  # 조이스틱으로 눌린 키 추적 (버튼과 분리)
 
 # 데이터 수신 통계
 stats = {
@@ -47,6 +52,18 @@ recent_data = {
     "last_joystick": None,  # {"x": 0.5, "y": 0.5, "keys": ["up"], "time": datetime}
     "last_button": None      # {"button": "A", "pressed": True, "key": "space", "time": datetime}
 }
+
+# 마지막 조이스틱 상태 저장 (안드로이드에서 데이터가 같으면 전송하지 않는 문제 해결)
+last_joystick_state = {
+    "x": 0.0,
+    "y": 0.0,
+    "keys": set(),  # 마지막에 눌려있던 키들
+    "is_active": False,  # 조이스틱이 활성 상태인지 (중앙이 아닌지)
+    "active_keys": set()  # 현재 활성화된 키들 (히스테리시스 적용)
+}
+
+# 마지막 버튼 상태 저장 (안드로이드에서 데이터가 같으면 전송하지 않는 문제 해결)
+last_button_states = {}  # {button_name: {"pressed": bool, "key": key, "time": datetime}}
 
 # 기본 포트 (CLI/환경 변수로 덮어쓰기 가능)
 DEFAULT_SERVER_PORT = Port
@@ -67,17 +84,32 @@ KEY_MAPPING = {
     
     # 버튼 → 키보드 키
     "A": Key.space,         # 공격
-    "B": Key.enter,         # 게임 시작
-    "X": '',                # 미할당
+    "B": Key.enter,         # 달리기/공격
+    "X": '1',               # 게임 시작
     "Y": '',                # 미할당
 }
+
+# 조이스틱 방향 키 세트 (성능 최적화: 반복 생성 방지)
+JOYSTICK_KEY_SET = {KEY_MAPPING["up"], KEY_MAPPING["down"], KEY_MAPPING["left"], KEY_MAPPING["right"]}
 
 # 조이스틱 임계값 (이 값 이상일 때만 키 입력)
 JOYSTICK_THRESHOLD = 0.3  # 30% 이상
 
+# 조이스틱 히스테리시스 (떨림 방지)
+# 키를 누르기 시작하는 임계값과 떼는 임계값을 다르게 설정하여 떨림 방지
+JOYSTICK_THRESHOLD_ON = 0.3   # 키를 누르기 시작하는 임계값
+JOYSTICK_THRESHOLD_OFF = 0.25 # 키를 떼는 임계값 (더 낮게 설정하여 떨림 방지)
+
 # 입력 정지 타임아웃 (초)
 # 이 시간 동안 조이스틱/버튼 데이터가 안 들어오면 자동으로 모든 키를 뗀다
-INACTIVITY_RELEASE_TIMEOUT = 0.1
+# 안드로이드에서 데이터가 같으면 전송하지 않는 문제를 고려하여 시간 증가
+INACTIVITY_RELEASE_TIMEOUT = 0.5  # 0.5초로 증가 (안드로이드 데이터 전송 특성 고려)
+
+# 로깅 설정 (성능 최적화)
+ENABLE_VERBOSE_LOGGING = False  # True로 설정하면 상세 로그 출력
+
+# 접속자 정보 정리 설정
+USER_CLEANUP_TIMEOUT = 3600  # 1시간 (초 단위) - 이 시간 이상 비활성 접속자 제거
 
 
 def resolve_server_port(cli_port=None):
@@ -164,6 +196,23 @@ def update_user_activity():
     connected_users[ip]["last_seen"] = now
     connected_users[ip]["request_count"] += 1
 
+def cleanup_inactive_users():
+    """오래된 접속자 정보 정리 (메모리 최적화)"""
+    now = datetime.now()
+    inactive_ips = []
+    
+    for ip, info in connected_users.items():
+        elapsed = (now - info["last_seen"]).total_seconds()
+        if elapsed > USER_CLEANUP_TIMEOUT:
+            inactive_ips.append(ip)
+    
+    # 비활성 접속자 제거
+    for ip in inactive_ips:
+        del connected_users[ip]
+    
+    if inactive_ips:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cleanup] {len(inactive_ips)}명의 비활성 접속자 제거됨")
+
 @app.route('/', methods=['GET'])
 def dashboard():
     """메인 대시보드 HTML 페이지"""
@@ -180,423 +229,18 @@ def dashboard():
         f'http://localhost:{server_port}</a>'
     )
     
-    html_template = """
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>게임 서버 대시보드</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-        h1 {
-            color: white;
-            text-align: center;
-            margin-bottom: 30px;
-            font-size: 2.5em;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
-        }
-        .dashboard {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }
-        .card {
-            background: white;
-            border-radius: 15px;
-            padding: 25px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
-            transition: transform 0.3s;
-        }
-        .card:hover {
-            transform: translateY(-5px);
-        }
-        .card h2 {
-            color: #667eea;
-            margin-bottom: 15px;
-            font-size: 1.5em;
-            border-bottom: 2px solid #667eea;
-            padding-bottom: 10px;
-        }
-        .stat-item {
-            display: flex;
-            justify-content: space-between;
-            padding: 10px 0;
-            border-bottom: 1px solid #eee;
-        }
-        .stat-item:last-child {
-            border-bottom: none;
-        }
-        .stat-label {
-            color: #666;
-            font-weight: 500;
-        }
-        .stat-value {
-            color: #333;
-            font-weight: bold;
-            font-size: 1.1em;
-        }
-        .status-badge {
-            display: inline-block;
-            padding: 5px 15px;
-            border-radius: 20px;
-            font-size: 0.9em;
-            font-weight: bold;
-        }
-        .status-active {
-            background: #4caf50;
-            color: white;
-        }
-        .status-inactive {
-            background: #f44336;
-            color: white;
-        }
-        .users-list {
-            background: white;
-            border-radius: 15px;
-            padding: 25px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
-        }
-        .users-list h2 {
-            color: #667eea;
-            margin-bottom: 20px;
-            font-size: 1.5em;
-            border-bottom: 2px solid #667eea;
-            padding-bottom: 10px;
-        }
-        .user-item {
-            background: #f5f5f5;
-            border-radius: 10px;
-            padding: 15px;
-            margin-bottom: 10px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .user-info {
-            flex: 1;
-        }
-        .user-ip {
-            font-weight: bold;
-            color: #333;
-            font-size: 1.1em;
-            margin-bottom: 5px;
-        }
-        .user-details {
-            color: #666;
-            font-size: 0.9em;
-        }
-        .no-users {
-            text-align: center;
-            color: #999;
-            padding: 40px;
-            font-style: italic;
-        }
-        .last-update {
-            text-align: center;
-            color: white;
-            margin-top: 20px;
-            font-size: 0.9em;
-            opacity: 0.8;
-        }
-        .refresh-btn {
-            background: #667eea;
-            color: white;
-            border: none;
-            padding: 10px 20px;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 1em;
-            margin-top: 10px;
-            transition: background 0.3s;
-        }
-        .refresh-btn:hover {
-            background: #5568d3;
-        }
-        .ip-link {
-            color: #667eea;
-            text-decoration: none;
-            font-weight: bold;
-        }
-        .ip-link:hover {
-            text-decoration: underline;
-        }
-        .server-info {
-            background: rgba(255,255,255,0.1);
-            border-radius: 10px;
-            padding: 15px;
-            margin-bottom: 20px;
-            color: white;
-        }
-        .server-info h3 {
-            margin-bottom: 10px;
-            font-size: 1.1em;
-        }
-        .server-info p {
-            margin: 5px 0;
-            font-size: 0.95em;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🎮 게임 서버 대시보드</h1>
-        
-        <div class="server-info">
-            <h3>📡 서버 접속 정보</h3>
-            <p><strong>로컬 접속:</strong> """ + local_link_html + """</p>
-            <p id="network-access"><strong>내부망 접속:</strong> <span id="network-ips">""" + ip_links_html + """</span></p>
-            <p style="font-size: 0.85em; opacity: 0.9; margin-top: 10px;">
-                💡 같은 Wi-Fi/네트워크에 연결된 다른 기기에서 위의 IP 주소로 접속하세요
-            </p>
-        </div>
-        
-        <div class="dashboard">
-            <div class="card">
-                <h2>📊 서버 상태</h2>
-                <div class="stat-item">
-                    <span class="stat-label">서버 IP 주소:</span>
-                    <span class="stat-value" id="server-ip" style="font-size: 0.9em; word-break: break-all;">""" + ip_list_text + """</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">서버 실행 시간:</span>
-                    <span class="stat-value" id="server-uptime">-</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">현재 시간:</span>
-                    <span class="stat-value" id="current-time">-</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">데이터 수신 상태:</span>
-                    <span class="stat-value" id="data-status">-</span>
-                </div>
-            </div>
-            
-            <div class="card">
-                <h2>🕹️ 조이스틱 통계</h2>
-                <div class="stat-item">
-                    <span class="stat-label">총 수신 횟수:</span>
-                    <span class="stat-value" id="joystick-count">0</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">마지막 수신:</span>
-                    <span class="stat-value" id="joystick-last">-</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">상태:</span>
-                    <span class="stat-value" id="joystick-status">-</span>
-                </div>
-            </div>
-            
-            <div class="card">
-                <h2>🔘 버튼 통계</h2>
-                <div class="stat-item">
-                    <span class="stat-label">총 수신 횟수:</span>
-                    <span class="stat-value" id="button-count">0</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">마지막 수신:</span>
-                    <span class="stat-value" id="button-last">-</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">상태:</span>
-                    <span class="stat-value" id="button-status">-</span>
-                </div>
-            </div>
-        </div>
-        
-        <div class="dashboard" style="margin-bottom: 30px;">
-            <div class="card">
-                <h2>📡 최근 조이스틱 입력</h2>
-                <div id="recent-joystick" style="padding: 15px;">
-                    <div class="no-users">데이터 없음</div>
-                </div>
-            </div>
-            
-            <div class="card">
-                <h2>🔘 최근 버튼 입력</h2>
-                <div id="recent-button" style="padding: 15px;">
-                    <div class="no-users">데이터 없음</div>
-                </div>
-            </div>
-        </div>
-        
-        <div class="users-list">
-            <h2>👥 접속자 목록</h2>
-            <div id="users-container">
-                <div class="no-users">접속자 정보를 불러오는 중...</div>
-            </div>
-            <button class="refresh-btn" onclick="loadData()">새로고침</button>
-        </div>
-        
-        <div class="last-update">
-            마지막 업데이트: <span id="last-update">-</span>
-        </div>
-    </div>
-    
-    <script>
-        function formatTime(dateStr) {
-            if (!dateStr) return '-';
-            const date = new Date(dateStr);
-            return date.toLocaleString('ko-KR');
-        }
-        
-        function formatElapsed(seconds) {
-            if (seconds === null || seconds === undefined) return '-';
-            if (seconds < 60) return seconds.toFixed(1) + '초 전';
-            if (seconds < 3600) return Math.floor(seconds / 60) + '분 전';
-            return Math.floor(seconds / 3600) + '시간 전';
-        }
-        
-        function formatUptime(startTime) {
-            const start = new Date(startTime);
-            const now = new Date();
-            const diff = Math.floor((now - start) / 1000);
-            const hours = Math.floor(diff / 3600);
-            const minutes = Math.floor((diff % 3600) / 60);
-            const seconds = diff % 60;
-            return `${hours}시간 ${minutes}분 ${seconds}초`;
-        }
-        
-        function loadData() {
-            // 병렬로 API 호출 (성능 최적화)
-            Promise.all([
-                fetch('/status').then(r => r.json()),
-                fetch('/users').then(r => r.json())
-            ]).then(([statusData, usersData]) => {
-                // 서버 상태 업데이트
-                document.getElementById('server-uptime').textContent = 
-                    formatUptime(statusData.server_start_time);
-                document.getElementById('current-time').textContent = 
-                    formatTime(statusData.current_time);
-                
-                const receiving = statusData.summary.receiving_data;
-                const statusBadge = receiving 
-                    ? '<span class="status-badge status-active">수신 중</span>'
-                    : '<span class="status-badge status-inactive">대기 중</span>';
-                document.getElementById('data-status').innerHTML = statusBadge;
-                
-                // 조이스틱 통계
-                const js = statusData.statistics.joystick;
-                document.getElementById('joystick-count').textContent = js.total_received;
-                document.getElementById('joystick-last').textContent = 
-                    js.last_received ? formatTime(js.last_received) : '없음';
-                const jsStatus = js.is_active 
-                    ? '<span class="status-badge status-active">활성</span>'
-                    : '<span class="status-badge status-inactive">비활성</span>';
-                document.getElementById('joystick-status').innerHTML = jsStatus;
-                
-                // 버튼 통계
-                const btn = statusData.statistics.button;
-                document.getElementById('button-count').textContent = btn.total_received;
-                document.getElementById('button-last').textContent = 
-                    btn.last_received ? formatTime(btn.last_received) : '없음';
-                const btnStatus = btn.is_active 
-                    ? '<span class="status-badge status-active">활성</span>'
-                    : '<span class="status-badge status-inactive">비활성</span>';
-                document.getElementById('button-status').innerHTML = btnStatus;
-                
-                // 최근 수신 데이터 표시
-                const recentJoystick = document.getElementById('recent-joystick');
-                if (statusData.recent_data && statusData.recent_data.joystick) {
-                    const js = statusData.recent_data.joystick;
-                    const keysDisplay = js.keys && js.keys.length > 0 
-                        ? js.keys.join(', ') 
-                        : '없음 (중앙)';
-                    recentJoystick.innerHTML = `
-                        <div style="line-height: 1.8;">
-                            <div><strong>X:</strong> ${js.x}</div>
-                            <div><strong>Y:</strong> ${js.y}</div>
-                            ${js.strength !== undefined ? `<div><strong>강도:</strong> ${js.strength}%</div>` : ''}
-                            <div><strong>입력된 키:</strong> ${keysDisplay}</div>
-                            <div style="margin-top: 10px; font-size: 0.9em; color: #666;">
-                                ${formatTime(js.time)}
-                            </div>
-                        </div>
-                    `;
-                } else {
-                    recentJoystick.innerHTML = '<div class="no-users">데이터 없음</div>';
-                }
-                
-                const recentButton = document.getElementById('recent-button');
-                if (statusData.recent_data && statusData.recent_data.button) {
-                    const btn = statusData.recent_data.button;
-                    const actionBadge = btn.pressed 
-                        ? '<span class="status-badge status-active">눌림</span>'
-                        : '<span class="status-badge status-inactive">떼어짐</span>';
-                    recentButton.innerHTML = `
-                        <div style="line-height: 1.8;">
-                            <div><strong>버튼:</strong> ${btn.button}</div>
-                            <div><strong>상태:</strong> ${actionBadge}</div>
-                            <div><strong>키보드 키:</strong> ${btn.key}</div>
-                            <div style="margin-top: 10px; font-size: 0.9em; color: #666;">
-                                ${formatTime(btn.time)}
-                            </div>
-                        </div>
-                    `;
-                } else {
-                    recentButton.innerHTML = '<div class="no-users">데이터 없음</div>';
-                }
-                
-                // 접속자 목록 업데이트
-                const container = document.getElementById('users-container');
-                if (usersData.users && usersData.users.length > 0) {
-                    container.innerHTML = usersData.users.map(user => {
-                        const firstSeen = formatTime(user.first_seen);
-                        const lastSeen = formatTime(user.last_seen);
-                        const elapsed = formatElapsed(user.elapsed_seconds);
-                        
-                        return `
-                            <div class="user-item">
-                                <div class="user-info">
-                                    <div class="user-ip">${user.ip}</div>
-                                    <div class="user-details">
-                                        첫 접속: ${firstSeen}<br>
-                                        마지막 활동: ${lastSeen} (${elapsed})<br>
-                                        요청 횟수: ${user.request_count}회
-                                    </div>
-                                </div>
-                            </div>
-                        `;
-                    }).join('');
-                } else {
-                    container.innerHTML = '<div class="no-users">접속자가 없습니다</div>';
-                }
-                
-                document.getElementById('last-update').textContent = new Date().toLocaleString('ko-KR');
-            }).catch(error => {
-                console.error('Error:', error);
-            });
-        }
-        
-        // 초기 로드 및 자동 새로고침 (1초마다)
-        loadData();
-        setInterval(loadData, 100);
-    </script>
-</body>
-</html>
-    """
     update_user_activity()
-    return render_template_string(html_template)
+    return render_template('dashboard.html', 
+                         local_link_html=local_link_html,
+                         ip_links_html=ip_links_html,
+                         ip_list_text=ip_list_text)
 
 @app.route('/users', methods=['GET'])
 def get_users():
     """접속자 목록 반환"""
+    # 비활성 접속자 정리 (최적화)
+    cleanup_inactive_users()
+    
     now = datetime.now()
     users_list = []
     
@@ -682,10 +326,165 @@ def get_status():
         }
     })
 
-@app.route('/joystick', methods=['POST'])
+def calculate_joystick_keys(x, y):
+    """
+    조이스틱 입력값(x, y)을 키 매핑으로 변환 (히스테리시스 적용)
+    
+    Args:
+        x: 조이스틱 X 좌표 (-1.0 ~ 1.0)
+        y: 조이스틱 Y 좌표 (-1.0 ~ 1.0)
+    
+    Returns:
+        tuple: (target_keys: set, keys_to_press: list, is_active: bool)
+    """
+    target_keys = set()  # 눌려야 할 키 집합
+    keys_to_press = []  # 눌려야 할 키 이름 리스트
+    is_active = False  # 조이스틱이 활성 상태인지
+    
+    # 이전에 활성화된 키들 가져오기
+    previous_active_keys = last_joystick_state.get("active_keys", set())
+    
+    # 히스테리시스 적용: 키를 누르기 시작할 때는 높은 임계값, 떼기 시작할 때는 낮은 임계값 사용
+    # 위/아래 방향
+    up_was_active = KEY_MAPPING["up"] in previous_active_keys
+    down_was_active = KEY_MAPPING["down"] in previous_active_keys
+    
+    if up_was_active:
+        # 위 키가 이미 눌려있었으면 낮은 임계값으로 유지 (떨림 방지)
+        if y > JOYSTICK_THRESHOLD_OFF:
+            target_keys.add(KEY_MAPPING["up"])
+            keys_to_press.append("up")
+            is_active = True
+    else:
+        # 위 키가 눌려있지 않았으면 높은 임계값으로 시작
+        if y > JOYSTICK_THRESHOLD_ON:
+            target_keys.add(KEY_MAPPING["up"])
+            keys_to_press.append("up")
+            is_active = True
+    
+    if down_was_active:
+        # 아래 키가 이미 눌려있었으면 낮은 임계값으로 유지 (떨림 방지)
+        if y < -JOYSTICK_THRESHOLD_OFF:
+            target_keys.add(KEY_MAPPING["down"])
+            keys_to_press.append("down")
+            is_active = True
+    else:
+        # 아래 키가 눌려있지 않았으면 높은 임계값으로 시작
+        if y < -JOYSTICK_THRESHOLD_ON:
+            target_keys.add(KEY_MAPPING["down"])
+            keys_to_press.append("down")
+            is_active = True
+    
+    # 좌/우 방향
+    right_was_active = KEY_MAPPING["right"] in previous_active_keys
+    left_was_active = KEY_MAPPING["left"] in previous_active_keys
+    
+    if right_was_active:
+        # 오른쪽 키가 이미 눌려있었으면 낮은 임계값으로 유지 (떨림 방지)
+        if x > JOYSTICK_THRESHOLD_OFF:
+            target_keys.add(KEY_MAPPING["right"])
+            keys_to_press.append("right")
+            is_active = True
+    else:
+        # 오른쪽 키가 눌려있지 않았으면 높은 임계값으로 시작
+        if x > JOYSTICK_THRESHOLD_ON:
+            target_keys.add(KEY_MAPPING["right"])
+            keys_to_press.append("right")
+            is_active = True
+    
+    if left_was_active:
+        # 왼쪽 키가 이미 눌려있었으면 낮은 임계값으로 유지 (떨림 방지)
+        if x < -JOYSTICK_THRESHOLD_OFF:
+            target_keys.add(KEY_MAPPING["left"])
+            keys_to_press.append("left")
+            is_active = True
+    else:
+        # 왼쪽 키가 눌려있지 않았으면 높은 임계값으로 시작
+        if x < -JOYSTICK_THRESHOLD_ON:
+            target_keys.add(KEY_MAPPING["left"])
+            keys_to_press.append("left")
+            is_active = True
+    
+    return target_keys, keys_to_press, is_active
+
+
+def process_joystick_keys(target_keys):
+    """
+    조이스틱 키 입력 처리 (press/release)
+    버튼과 조이스틱 키를 분리하여 추적하여 간섭 방지
+    
+    Args:
+        target_keys: 눌려야 할 키 집합
+    """
+    global pressed_joystick_keys, pressed_keyboard_keys, pressed_button_keys
+    
+    with keyboard_lock:
+        # 조이스틱으로 눌려야 하는 키 (조이스틱 방향 키만)
+        target_joystick_keys = target_keys & JOYSTICK_KEY_SET
+        
+        # 조이스틱으로 눌려야 하는데 안 눌려있는 키 → 누르기
+        # 버튼이 이미 눌려있는 키는 물리적으로 누르지 않지만, 조이스틱 추적에는 포함
+        keys_to_add_physically = target_joystick_keys - pressed_keyboard_keys - pressed_button_keys
+        for key in keys_to_add_physically:
+            try:
+                keyboard.press(key)
+                pressed_keyboard_keys.add(key)
+                pressed_joystick_keys.add(key)
+            except Exception as e:
+                if ENABLE_VERBOSE_LOGGING:
+                    print(f"Error pressing key {key}: {e}")
+        
+        # 이미 눌려있지만 조이스틱 추적에 없는 키 추가 (버튼을 떼고 난 후 조이스틱이 계속 같은 방향일 때)
+        # 버튼이 눌려있지 않고, 키가 이미 눌려있고, 조이스틱이 이 키를 눌러야 하면 추적에 추가
+        keys_already_pressed = (target_joystick_keys & pressed_keyboard_keys) - pressed_button_keys - pressed_joystick_keys
+        for key in keys_already_pressed:
+            # 조이스틱 추적에 추가 (물리적으로는 이미 눌려있음)
+            pressed_joystick_keys.add(key)
+            if ENABLE_VERBOSE_LOGGING:
+                print(f"[Key] Joystick takes over already pressed key: {key}")
+        
+        # 이미 눌려있고 조이스틱 추적에도 있는 키는 유지 (키가 지속적으로 눌려있도록 보장)
+        # 키가 이미 눌려있고 조이스틱이 이 키를 눌러야 하면, 주기적으로 다시 눌러서 지속성 보장
+        keys_to_maintain = target_joystick_keys & pressed_joystick_keys & pressed_keyboard_keys
+        for key in keys_to_maintain:
+            # 키가 이미 눌려있지만, 지속성을 위해 주기적으로 다시 누르기
+            # 일부 시스템에서는 키가 자동으로 해제될 수 있으므로 주기적으로 다시 눌러야 함
+            try:
+                # 키를 release 후 press하여 지속성 보장 (더 확실한 방법)
+                keyboard.release(key)
+                time.sleep(0.001)  # 매우 짧은 딜레이
+                keyboard.press(key)
+            except Exception as e:
+                if ENABLE_VERBOSE_LOGGING:
+                    print(f"Error maintaining key {key}: {e}")
+        
+        # 조이스틱으로 눌려있는데 뗴야 하는 키 → 떼기
+        # 버튼이 눌려있는 키는 건드리지 않음
+        keys_to_remove = (pressed_joystick_keys & JOYSTICK_KEY_SET) - target_joystick_keys
+        for key in keys_to_remove:
+            # 버튼이 이 키를 사용 중이면 건드리지 않음
+            if key not in pressed_button_keys:
+                try:
+                    keyboard.release(key)
+                    pressed_keyboard_keys.discard(key)
+                    pressed_joystick_keys.discard(key)
+                except Exception as e:
+                    if ENABLE_VERBOSE_LOGGING:
+                        print(f"Error releasing key {key}: {e}")
+            else:
+                # 버튼이 사용 중이면 조이스틱 추적에서만 제거 (물리적 키는 유지)
+                pressed_joystick_keys.discard(key)
+        
+        # 조이스틱 키 추적 업데이트 (버튼과 분리)
+        # 조이스틱 키만 유지하고 새로운 키 추가
+        pressed_joystick_keys &= JOYSTICK_KEY_SET  # 조이스틱 키만 유지
+        pressed_joystick_keys |= target_joystick_keys  # 새로운 조이스틱 키 추가 (버튼이 눌러도 추적)
+
+
+@app.route('/joystick', methods=['POST', 'OPTIONS'])
 def receive_joystick():
     """
-    조이스틱 데이터를 키보드 입력으로 변환
+    조이스틱 데이터를 키보드 입력으로 변환 (최적화: 차등 처리)
     
     받는 데이터:
     {
@@ -700,58 +499,64 @@ def receive_joystick():
     - x > 0.3  → 오른쪽 키 (D 또는 →)
     - x < -0.3 → 왼쪽 키 (A 또는 ←)
     """
+    # OPTIONS 요청 처리 (CORS preflight)
+    if request.method == 'OPTIONS':
+        return jsonify({"status": "ok"}), 200
+    
+    # 전역 변수 사용 선언 (함수 시작 부분에 위치)
+    global pressed_joystick_keys, pressed_keyboard_keys, pressed_button_keys
+    
     try:
         update_user_activity()
+        
+        # Content-Type 확인
+        if not request.is_json:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Joystick] ⚠️ 400 에러: Content-Type이 application/json이 아닙니다. Content-Type: {request.content_type}")
+            return jsonify({"status": "error", "message": "Content-Type must be application/json"}), 400
+        
         data = request.get_json()
+        
+        # 데이터 유효성 검사
+        if data is None:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Joystick] ⚠️ 400 에러: JSON 데이터가 없습니다")
+            return jsonify({"status": "error", "message": "No JSON data provided"}), 400
+        
         x = data.get('x', 0.0)  # -1.0 ~ 1.0
         y = data.get('y', 0.0)  # -1.0 ~ 1.0
         strength = data.get('strength', 0)
+        reset_requested = data.get('reset', False)  # 게임 재시작 플래그
+        
+        # 데이터 타입 검증
+        try:
+            x = float(x)
+            y = float(y)
+        except (ValueError, TypeError):
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Joystick] ⚠️ 400 에러: 잘못된 데이터 타입 - x: {x}, y: {y}")
+            return jsonify({"status": "error", "message": f"Invalid data type: x and y must be numbers"}), 400
+        
+        # 게임 재시작 요청이 있으면 상태 초기화
+        if reset_requested:
+            reset_all_states_internal()
+            if ENABLE_VERBOSE_LOGGING:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] [Joystick] 게임 재시작 - 상태 초기화됨")
         
         # 통계 업데이트
         stats["joystick_count"] += 1
         now = datetime.now()
         stats["last_joystick_time"] = now
         
-        # 이전에 눌려있던 키 모두 떼기
-        release_all_keys()
+        # 조이스틱 입력값을 키 매핑으로 변환 (히스테리시스 적용)
+        target_keys, keys_to_press, is_active = calculate_joystick_keys(x, y)
         
-        # 임계값 이상일 때만 키 입력
-        if abs(x) < JOYSTICK_THRESHOLD and abs(y) < JOYSTICK_THRESHOLD:
-            # 조이스틱이 중앙에 있으면 모든 키 떼기
-            keys_to_press = []
-            recent_data["last_joystick"] = {
-                "x": round(x, 2),
-                "y": round(y, 2),
-                "keys": [],
-                "time": now.isoformat()
-            }
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Joystick] ✓ 데이터 수신됨 (중앙 위치) - 총 {stats['joystick_count']}회")
-            return jsonify({"status": "ok", "keys": "none"})
+        # 마지막 조이스틱 상태 저장 (안드로이드 데이터 전송 문제 해결)
+        last_joystick_state["x"] = x
+        last_joystick_state["y"] = y
+        last_joystick_state["keys"] = target_keys.copy()
+        last_joystick_state["is_active"] = is_active
+        last_joystick_state["active_keys"] = target_keys.copy()  # 히스테리시스를 위한 활성 키 저장
         
-        keys_to_press = []
-        
-        # 위/아래 방향
-        if y > JOYSTICK_THRESHOLD:
-            # 위쪽 (앞으로)
-            press_key(KEY_MAPPING["up"])
-            keys_to_press.append("up")
-        elif y < -JOYSTICK_THRESHOLD:
-            # 아래쪽 (뒤로)
-            press_key(KEY_MAPPING["down"])
-            keys_to_press.append("down")
-        
-        # 좌/우 방향
-        if x > JOYSTICK_THRESHOLD:
-            # 오른쪽
-            press_key(KEY_MAPPING["right"])
-            keys_to_press.append("right")
-        elif x < -JOYSTICK_THRESHOLD:
-            # 왼쪽
-            press_key(KEY_MAPPING["left"])
-            keys_to_press.append("left")
-        
-        # 대각선 이동 (동시에 여러 키 누르기)
-        # 이미 위에서 처리됨
+        # 조이스틱 키 입력 처리 (press/release)
+        process_joystick_keys(target_keys)
         
         # 최근 데이터 저장
         recent_data["last_joystick"] = {
@@ -762,8 +567,13 @@ def receive_joystick():
             "time": now.isoformat()
         }
         
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Joystick] ✓ 데이터 수신됨 - "
-              f"X: {x:.2f}, Y: {y:.2f} → Keys: {keys_to_press} (총 {stats['joystick_count']}회)")
+        # 로깅 최소화 (성능 최적화)
+        if ENABLE_VERBOSE_LOGGING:
+            if keys_to_press:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] [Joystick] ✓ 데이터 수신됨 - "
+                      f"X: {x:.2f}, Y: {y:.2f} → Keys: {keys_to_press} (총 {stats['joystick_count']}회)")
+            else:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] [Joystick] ✓ 데이터 수신됨 (중앙 위치) - 총 {stats['joystick_count']}회")
         
         return jsonify({
             "status": "ok",
@@ -772,10 +582,14 @@ def receive_joystick():
         })
         
     except Exception as e:
-        print(f"Error receiving joystick data: {e}")
+        error_msg = f"Error receiving joystick data: {e}"
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Joystick] ⚠️ 400 에러: {error_msg}")
+        import traceback
+        if ENABLE_VERBOSE_LOGGING:
+            traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 400
 
-@app.route('/button', methods=['POST'])
+@app.route('/button', methods=['POST', 'OPTIONS'])
 def receive_button():
     """
     버튼 데이터를 키보드 입력으로 변환
@@ -786,11 +600,35 @@ def receive_button():
         "pressed": true     # true = 눌림, false = 떼어짐
     }
     """
+    # OPTIONS 요청 처리 (CORS preflight)
+    if request.method == 'OPTIONS':
+        return jsonify({"status": "ok"}), 200
+    
+    # 전역 변수 사용 선언 (함수 시작 부분에 위치)
+    global pressed_joystick_keys, pressed_button_keys, pressed_keyboard_keys, pressed_keys
+    
     try:
         update_user_activity()
+        
+        # Content-Type 확인
+        if not request.is_json:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Button] ⚠️ 400 에러: Content-Type이 application/json이 아닙니다. Content-Type: {request.content_type}")
+            return jsonify({"status": "error", "message": "Content-Type must be application/json"}), 400
+        
         data = request.get_json()
+        
+        # 데이터 유효성 검사
+        if data is None:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Button] ⚠️ 400 에러: JSON 데이터가 없습니다")
+            return jsonify({"status": "error", "message": "No JSON data provided"}), 400
+        
         button = data.get('button', '')
         pressed = data.get('pressed', False)
+        
+        # 버튼 이름 검증
+        if not button:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Button] ⚠️ 400 에러: 버튼 이름이 없습니다")
+            return jsonify({"status": "error", "message": "Button name is required"}), 400
         
         # 통계 업데이트
         stats["button_count"] += 1
@@ -798,17 +636,123 @@ def receive_button():
         stats["last_button_time"] = now
         
         if button not in KEY_MAPPING:
-            return jsonify({"status": "error", "message": f"Unknown button: {button}"}), 400
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Button] ⚠️ 400 에러: 알 수 없는 버튼 - {button}")
+            return jsonify({"status": "error", "message": f"Unknown button: {button}. Available buttons: {list(KEY_MAPPING.keys())}"}), 400
         
         key = KEY_MAPPING[button]
         action = "pressed" if pressed else "released"
         
+        # 빈 키 매핑 체크 (Y 버튼 등)
+        if not key:
+            return jsonify({"status": "ok", "message": f"Button {button} has no key mapping"})
+        
+        # 이전 버튼 상태 확인 (중복 처리 방지)
+        previous_state = last_button_states.get(button, {}).get("pressed", False)
+        
+        # 상태가 변경되지 않았으면 처리하지 않음 (계속 눌리는 문제 해결)
+        if previous_state == pressed:
+            # 이미 같은 상태이므로 추가 처리 없이 반환
+            return jsonify({
+                "status": "ok",
+                "received": True,
+                "button": button,
+                "action": action,
+                "key": str(key),
+                "message": "State unchanged, skipped"
+            })
+        
+        # 마지막 버튼 상태 저장 (안드로이드 데이터 전송 문제 해결)
+        last_button_states[button] = {
+            "pressed": pressed,
+            "key": key,
+            "time": now
+        }
+        
+        # 상태가 변경되었을 때만 키 입력 처리 (조이스틱과 분리)
         if pressed:
-            press_key(key)
-            pressed_keys.add(button)
+            # 버튼이 눌렸을 때만 press (이미 눌려있지 않은 경우만)
+            if button not in pressed_keys:
+                with keyboard_lock:
+                    is_joystick_key = key in JOYSTICK_KEY_SET
+                    
+                    # 조이스틱 방향 키인 경우: 조이스틱이 이 키를 계속 누르고 있어야 하는지 확인
+                    if is_joystick_key and key in last_joystick_state.get("active_keys", set()):
+                        # 조이스틱이 계속 이 키를 누르고 있어야 하므로 조이스틱 추적은 유지
+                        # 버튼도 이 키를 사용하므로 버튼 추적에 추가
+                        pressed_button_keys.add(key)
+                        if ENABLE_VERBOSE_LOGGING:
+                            print(f"[Key] Button pressed, joystick key already active: {key}")
+                    elif is_joystick_key and key in pressed_joystick_keys:
+                        # 조이스틱이 이 키를 사용하지 않으면 조이스틱 추적에서 제거
+                        pressed_joystick_keys.discard(key)
+                    elif not is_joystick_key and key in pressed_joystick_keys:
+                        # 조이스틱 방향 키가 아닌 경우: 조이스틱이 이 키를 사용 중이면 제거
+                        pressed_joystick_keys.discard(key)
+                    
+                    # 키가 이미 눌려있지 않으면 누르기
+                    if key not in pressed_keyboard_keys:
+                        try:
+                            keyboard.press(key)
+                            pressed_keyboard_keys.add(key)
+                            pressed_button_keys.add(key)
+                            if ENABLE_VERBOSE_LOGGING:
+                                print(f"[Key] Pressed (Button): {key}")
+                        except Exception as e:
+                            if ENABLE_VERBOSE_LOGGING:
+                                print(f"Error pressing key {key}: {e}")
+                    else:
+                        # 이미 눌려있으면 버튼 키로만 추적
+                        pressed_button_keys.add(key)
+                
+                pressed_keys.add(button)
         else:
-            release_key(key)
-            pressed_keys.discard(button)
+            # 버튼이 떼어졌을 때만 release (눌려있는 경우만)
+            if button in pressed_keys:
+                with keyboard_lock:
+                    # 버튼 키 추적에서 제거
+                    pressed_button_keys.discard(key)
+                    
+                    # 조이스틱이 이 키를 사용 중인지 확인
+                    is_joystick_key = key in JOYSTICK_KEY_SET
+                    
+                    if is_joystick_key:
+                        # 조이스틱 방향 키인 경우: 조이스틱이 현재 이 키를 계속 눌러야 하는지 확인
+                        should_keep_key = key in last_joystick_state.get("active_keys", set())
+                        
+                        if should_keep_key:
+                            # 조이스틱이 이 키를 계속 눌러야 함
+                            pressed_joystick_keys.add(key)
+                            # 키가 이미 눌려있으므로 해제하지 않음 (조이스틱이 계속 사용)
+                            if ENABLE_VERBOSE_LOGGING:
+                                print(f"[Key] Button released, joystick continues: {key}")
+                        else:
+                            # 조이스틱이 이 키를 사용하지 않으므로 해제
+                            if key in pressed_keyboard_keys:
+                                try:
+                                    keyboard.release(key)
+                                    pressed_keyboard_keys.discard(key)
+                                    pressed_joystick_keys.discard(key)
+                                    if ENABLE_VERBOSE_LOGGING:
+                                        print(f"[Key] Released (Button): {key}")
+                                except Exception as e:
+                                    if ENABLE_VERBOSE_LOGGING:
+                                        print(f"Error releasing key {key}: {e}")
+                    else:
+                        # 조이스틱 방향 키가 아닌 경우 (일반 버튼 키) - 바로 해제
+                        if key in pressed_keyboard_keys:
+                            try:
+                                keyboard.release(key)
+                                pressed_keyboard_keys.discard(key)
+                                if ENABLE_VERBOSE_LOGGING:
+                                    print(f"[Key] Released (Button): {key}")
+                            except Exception as e:
+                                if ENABLE_VERBOSE_LOGGING:
+                                    print(f"Error releasing key {key}: {e}")
+                
+                pressed_keys.discard(button)
+            # 버튼이 떼어졌으면 마지막 상태에서 제거
+            if button in last_button_states:
+                del last_button_states[button]
         
         # 최근 데이터 저장
         recent_data["last_button"] = {
@@ -819,8 +763,10 @@ def receive_button():
             "time": now.isoformat()
         }
         
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Button] ✓ 데이터 수신됨 - "
-              f"{button} {action} → Key: {key} (총 {stats['button_count']}회)")
+        # 로깅 최소화 (성능 최적화)
+        if ENABLE_VERBOSE_LOGGING:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Button] ✓ 데이터 수신됨 - "
+                  f"{button} {action} → Key: {key} (총 {stats['button_count']}회)")
         
         return jsonify({
             "status": "ok",
@@ -831,7 +777,11 @@ def receive_button():
         })
         
     except Exception as e:
-        print(f"Error receiving button data: {e}")
+        error_msg = f"Error receiving button data: {e}"
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Button] ⚠️ 400 에러: {error_msg}")
+        import traceback
+        if ENABLE_VERBOSE_LOGGING:
+            traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 400
 
 @app.route('/stop', methods=['POST'])
@@ -839,6 +789,40 @@ def stop_all():
     """모든 키 입력 중지"""
     release_all_keys()
     return jsonify({"status": "ok", "message": "All keys released"})
+
+@app.route('/reset', methods=['POST'])
+def reset_all_states():
+    """
+    모든 상태 초기화 (게임 재시작 시 사용)
+    키 상태, 조이스틱 상태, 버튼 상태 모두 초기화
+    """
+    try:
+        # 모든 키 해제
+        release_all_keys()
+        
+        # 조이스틱 상태 초기화
+        last_joystick_state["x"] = 0.0
+        last_joystick_state["y"] = 0.0
+        last_joystick_state["keys"] = set()
+        last_joystick_state["is_active"] = False
+        last_joystick_state["active_keys"] = set()
+        
+        # 버튼 상태 초기화
+        last_button_states.clear()
+        
+        # 통계는 유지 (선택사항)
+        # stats["joystick_count"] = 0
+        # stats["button_count"] = 0
+        
+        if ENABLE_VERBOSE_LOGGING:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Reset] 모든 상태 초기화됨")
+        
+        return jsonify({
+            "status": "ok",
+            "message": "All states reset successfully"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
 
 @app.route('/config', methods=['POST'])
 def update_key_mapping():
@@ -856,47 +840,88 @@ def update_key_mapping():
         return jsonify({"status": "error", "message": str(e)}), 400
 
 def press_key(key):
-    """키보드 키 누르기"""
+    """키보드 키 누르기 (동기화 처리로 끊김 방지, 중복 방지)"""
+    global pressed_keyboard_keys  # 전역 변수 사용 선언
     try:
-        # 키가 이미 눌려있지 않으면 누르기
-        if key not in pressed_keyboard_keys:
-            keyboard.press(key)
-            pressed_keyboard_keys.add(key)
+        with keyboard_lock:
+            # 키가 이미 눌려있지 않으면 누르기 (중복 방지)
+            if key not in pressed_keyboard_keys:
+                keyboard.press(key)
+                pressed_keyboard_keys.add(key)
+                if ENABLE_VERBOSE_LOGGING:
+                    print(f"[Key] Pressed: {key}")
     except Exception as e:
-        print(f"Error pressing key {key}: {e}")
+        if ENABLE_VERBOSE_LOGGING:
+            print(f"Error pressing key {key}: {e}")
 
 def release_key(key):
-    """키보드 키 떼기"""
+    """키보드 키 떼기 (동기화 처리로 끊김 방지, 확실한 해제 보장)"""
+    global pressed_keyboard_keys  # 전역 변수 사용 선언
     try:
-        # 키가 눌려있으면 떼기
-        if key in pressed_keyboard_keys:
-            keyboard.release(key)
-            pressed_keyboard_keys.discard(key)
+        with keyboard_lock:
+            # 키가 눌려있으면 떼기 (확실한 해제 보장)
+            if key in pressed_keyboard_keys:
+                keyboard.release(key)
+                pressed_keyboard_keys.discard(key)
+                if ENABLE_VERBOSE_LOGGING:
+                    print(f"[Key] Released: {key}")
     except Exception as e:
-        print(f"Error releasing key {key}: {e}")
+        if ENABLE_VERBOSE_LOGGING:
+            print(f"Error releasing key {key}: {e}")
 
 def release_all_keys():
-    """모든 키보드 키 떼기"""
+    """모든 키보드 키 떼기 (동기화 처리로 끊김 방지)"""
+    global pressed_joystick_keys, pressed_button_keys, pressed_keyboard_keys, pressed_keys  # 전역 변수 사용 선언
     try:
-        # 현재 눌려있는 모든 키보드 키를 떼기
-        keys_to_release = list(pressed_keyboard_keys)
-        for key in keys_to_release:
-            try:
-                keyboard.release(key)
-            except Exception as e:
-                print(f"Error releasing key {key}: {e}")
-        pressed_keyboard_keys.clear()
-        
-        # 버튼 추적도 초기화
-        pressed_keys.clear()
+        with keyboard_lock:
+            # 현재 눌려있는 모든 키보드 키를 떼기
+            keys_to_release = list(pressed_keyboard_keys)
+            for key in keys_to_release:
+                try:
+                    keyboard.release(key)
+                except Exception as e:
+                    if ENABLE_VERBOSE_LOGGING:
+                        print(f"Error releasing key {key}: {e}")
+            pressed_keyboard_keys.clear()
+            
+            # 버튼 및 조이스틱 추적도 초기화
+            pressed_keys.clear()
+            pressed_button_keys.clear()
+            pressed_joystick_keys.clear()
     except Exception as e:
-        print(f"Error releasing all keys: {e}")
+        if ENABLE_VERBOSE_LOGGING:
+            print(f"Error releasing all keys: {e}")
+
+def reset_all_states_internal():
+    """
+    내부 상태 초기화 함수 (게임 재시작 시 사용)
+    """
+    global pressed_joystick_keys, pressed_button_keys  # 전역 변수 사용 선언
+    # 모든 키 해제
+    release_all_keys()
+    
+    # 조이스틱 상태 초기화
+    last_joystick_state["x"] = 0.0
+    last_joystick_state["y"] = 0.0
+    last_joystick_state["keys"] = set()
+    last_joystick_state["is_active"] = False
+    last_joystick_state["active_keys"] = set()
+    
+    # 버튼 상태 초기화
+    last_button_states.clear()
+    
+    # 키 추적 초기화
+    with keyboard_lock:
+        pressed_button_keys.clear()
+        pressed_joystick_keys.clear()
 
 
 def input_watchdog_loop():
     """
     조이스틱/버튼 입력이 일정 시간 동안 안 들어오면
     자동으로 모든 키를 떼는 감시 루프.
+    안드로이드에서 데이터가 같으면 전송하지 않는 문제를 고려하여 개선됨.
+    조이스틱이 활성 상태일 때는 이전 입력을 지속합니다.
     """
     while True:
         try:
@@ -906,21 +931,69 @@ def input_watchdog_loop():
             # 조이스틱 입력 타임아웃 체크
             if stats["last_joystick_time"] is not None:
                 elapsed_js = (now - stats["last_joystick_time"]).total_seconds()
-                if elapsed_js > INACTIVITY_RELEASE_TIMEOUT:
-                    should_release = True
+                
+                # 조이스틱이 활성 상태일 때는 이전 입력을 지속
+                if last_joystick_state.get("is_active", False):
+                    # 조이스틱이 활성 상태이면 마지막 상태를 유지하기 위해 주기적으로 다시 적용
+                    # INACTIVITY_RELEASE_TIMEOUT 이후부터 주기적으로 상태 유지
+                    if elapsed_js > INACTIVITY_RELEASE_TIMEOUT:
+                        # 마지막 조이스틱 상태를 다시 적용하여 키 유지
+                        target_keys = last_joystick_state.get("active_keys", set())
+                        if target_keys:
+                            process_joystick_keys(target_keys)
+                            if ENABLE_VERBOSE_LOGGING:
+                                print(f"[Watchdog] 조이스틱 이전 입력 지속: {target_keys}")
+                    # 매우 긴 타임아웃(10초)이 지나면 해제 (연결 끊김으로 간주)
+                    if elapsed_js > 10.0:
+                        should_release = True
+                else:
+                    # 조이스틱이 중앙 상태였으면 타임아웃 후 해제
+                    if elapsed_js > INACTIVITY_RELEASE_TIMEOUT:
+                        should_release = True
 
-            # 버튼 입력 타임아웃 체크
+            # 버튼 입력 타임아웃 체크 (안드로이드 데이터 전송 특성 고려)
             if stats["last_button_time"] is not None:
                 elapsed_btn = (now - stats["last_button_time"]).total_seconds()
-                if elapsed_btn > INACTIVITY_RELEASE_TIMEOUT:
-                    should_release = True
+                # 버튼이 눌린 상태였으면 더 긴 타임아웃 적용 (안드로이드에서 같은 데이터를 보내지 않아도 유지)
+                if last_button_states:
+                    # 눌린 버튼이 있으면 더 긴 타임아웃 (1.5초)
+                    if elapsed_btn > INACTIVITY_RELEASE_TIMEOUT * 3:
+                        # 버튼 키 해제
+                        with keyboard_lock:
+                            for button_name, btn_state in list(last_button_states.items()):
+                                if btn_state["pressed"]:
+                                    try:
+                                        keyboard.release(btn_state["key"])
+                                        pressed_keyboard_keys.discard(btn_state["key"])
+                                        pressed_keys.discard(button_name)
+                                    except Exception as e:
+                                        if ENABLE_VERBOSE_LOGGING:
+                                            print(f"Error releasing button key {button_name}: {e}")
+                                    del last_button_states[button_name]
+                else:
+                    # 눌린 버튼이 없으면 일반 타임아웃
+                    if elapsed_btn > INACTIVITY_RELEASE_TIMEOUT:
+                        should_release = True
 
             # 일정 시간 동안 입력이 없는데 아직 키가 눌려있으면 해제
+            # 단, 조이스틱이 활성 상태였고 타임아웃이 짧으면 유지 (안드로이드 데이터 전송 특성 고려)
             if should_release and pressed_keyboard_keys:
-                release_all_keys()
+                # 조이스틱 방향 키만 선택적으로 해제 (버튼 키는 제외)
+                with keyboard_lock:
+                    # 버튼 키는 제외하고 조이스틱 키만 해제
+                    button_keys = {btn_state["key"] for btn_state in last_button_states.values() if btn_state["pressed"]}
+                    keys_to_release = list((pressed_keyboard_keys & JOYSTICK_KEY_SET) - button_keys)
+                    for key in keys_to_release:
+                        try:
+                            keyboard.release(key)
+                            pressed_keyboard_keys.discard(key)
+                        except Exception as e:
+                            if ENABLE_VERBOSE_LOGGING:
+                                print(f"Error releasing key {key}: {e}")
 
         except Exception as e:
-            print(f"Error in input watchdog loop: {e}")
+            if ENABLE_VERBOSE_LOGGING:
+                print(f"Error in input watchdog loop: {e}")
 
         # 너무 자주 돌지 않도록 약간 딜레이
         time.sleep(0.05)
@@ -973,7 +1046,7 @@ if __name__ == '__main__':
     print("  버튼:")
     print("    A → Space (점프)")
     print("    B → Shift (달리기/공격)")
-    print("    X → E (상호작용)")
+    print("    X → 1 (게임 시작)")
     print("    Y → Q (특수 액션)")
     print("=" * 60)
     print("💡 내부망 접속 방법:")
@@ -999,11 +1072,9 @@ if __name__ == '__main__':
     watchdog_thread.start()
 
     try:
-        app.run(host='0.0.0.0', port=server_port, debug=True)
+        # 최적화된 서버 설정 (끊김 방지)
+        app.run(host='0.0.0.0', port=server_port, debug=False, threaded=True, use_reloader=False)
     except KeyboardInterrupt:
         print("\n서버 종료 중...")
         release_all_keys()
         print("모든 키 입력 해제 완료")
-
-
-
