@@ -8,13 +8,16 @@ from datetime import datetime
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 
+import os
+
 from . import config
 from . import data_processor
 from . import keyboard_handler
 from . import utils
 
-# Flask 앱 초기화
-app = Flask(__name__)
+# Flask 앱 초기화 - 템플릿 폴더 경로 명시
+template_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'templates')
+app = Flask(__name__, template_folder=template_dir)
 CORS(app)
 
 # 서버 IP 주소 캐싱 (성능 최적화)

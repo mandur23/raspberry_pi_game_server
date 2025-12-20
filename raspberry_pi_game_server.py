@@ -1,15 +1,3 @@
-"""
-라즈베리파이 Flask 서버 - 게임 키 입력 버전
-게임 컨트롤러 입력을 키보드 입력으로 변환하여 게임에 전달
-
-설치 방법:
-    pip install flask flask-cors pynput paho-mqtt
-
-주의사항:
-    - Linux에서 키보드 입력 시뮬레이션은 관리자 권한이 필요할 수 있습니다
-    - 게임 창이 포커스되어 있어야 키 입력이 전달됩니다
-    - MQTT 브로커(mosquitto)가 실행 중이어야 MQTT 기능을 사용할 수 있습니다
-"""
 
 import argparse
 import json
@@ -23,31 +11,19 @@ from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 from pynput.keyboard import Key, Controller
 
-try:
-    import paho.mqtt.client as mqtt
-    MQTT_AVAILABLE = True
-except ImportError:
-    MQTT_AVAILABLE = False
-    print("⚠️  paho-mqtt가 설치되지 않았습니다. MQTT 기능을 사용하려면 'pip install paho-mqtt'를 실행하세요.")
-
 Port = 8443
 app = Flask(__name__)
 CORS(app)
 app.config["SERVER_PORT"] = Port
 
-# 키보드 컨트롤러
 keyboard = Controller()
-
-# 키 입력 동기화를 위한 Lock (끊김 방지)
 keyboard_lock = threading.Lock()
 
-# 현재 눌려있는 키 추적 (중복 입력 방지)
-pressed_keys = set()  # 버튼 이름 추적 ("A", "B", "X", "Y")
-pressed_keyboard_keys = set()  # 실제 키보드 키 추적 (Key.up, Key.down, 'w', 'a' 등)
-pressed_button_keys = set()  # 버튼으로 눌린 키 추적 (조이스틱과 분리)
-pressed_joystick_keys = set()  # 조이스틱으로 눌린 키 추적 (버튼과 분리)
+pressed_keys = set()
+pressed_keyboard_keys = set()
+pressed_button_keys = set()
+pressed_joystick_keys = set()
 
-# 데이터 수신 통계
 stats = {
     "joystick_count": 0,
     "button_count": 0,
@@ -56,90 +32,52 @@ stats = {
     "server_start_time": datetime.now()
 }
 
-# 최근 수신된 데이터 (HTML 표시용)
 recent_data = {
-    "last_joystick": None,  # {"x": 0.5, "y": 0.5, "keys": ["up"], "time": datetime}
-    "last_button": None      # {"button": "A", "pressed": True, "key": "space", "time": datetime}
+    "last_joystick": None,
+    "last_button": None
 }
 
-# 마지막 조이스틱 상태 저장 (안드로이드에서 데이터가 같으면 전송하지 않는 문제 해결)
 last_joystick_state = {
     "x": 0.0,
     "y": 0.0,
-    "keys": set(),  # 마지막에 눌려있던 키들
-    "is_active": False,  # 조이스틱이 활성 상태인지 (중앙이 아닌지)
-    "active_keys": set()  # 현재 활성화된 키들 (히스테리시스 적용)
+    "keys": set(),
+    "is_active": False,
+    "active_keys": set()
 }
 
-# 마지막 버튼 상태 저장 (안드로이드에서 데이터가 같으면 전송하지 않는 문제 해결)
-last_button_states = {}  # {button_name: {"pressed": bool, "key": key, "time": datetime}}
+last_button_states = {}
 
-# 기본 포트 (CLI/환경 변수로 덮어쓰기 가능)
 DEFAULT_SERVER_PORT = Port
 
-# 접속자 정보 추적
-connected_users = {}  # {ip: {"first_seen": datetime, "last_seen": datetime, "request_count": int}}
+connected_users = {}
 
-# 서버 IP 주소 캐싱 (성능 최적화)
 _cached_server_ips = None
 
-# MQTT 설정
-MQTT_BROKER_HOST = os.environ.get("MQTT_BROKER_HOST", "localhost")
-MQTT_BROKER_PORT = int(os.environ.get("MQTT_BROKER_PORT", "1883"))
-MQTT_TOPIC_PREFIX = os.environ.get("MQTT_TOPIC_PREFIX", "game_server")
-MQTT_CLIENT_ID = os.environ.get("MQTT_CLIENT_ID", f"game_server_{os.getpid()}")
-MQTT_USERNAME = os.environ.get("MQTT_USERNAME", None)
-MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", None)
-MQTT_ENABLED = os.environ.get("MQTT_ENABLED", "true").lower() == "true"
-
-# MQTT 클라이언트 (초기화는 나중에)
-mqtt_client = None
-mqtt_connected = False
-mqtt_lock = threading.Lock()
-
-# 키 매핑 설정
 KEY_MAPPING = {
-    # 조이스틱 방향 → 키보드 키
-    "up": Key.up,           # 또는 'w'
-    "down": Key.down,       # 또는 's'
-    "left": Key.left,       # 또는 'a'
-    "right": Key.right,     # 또는 'd'
-    
-    # 버튼 → 키보드 키
-    "A": Key.space,         # 공격
-    "B": Key.enter,         # 달리기/공격
-    "X": '1',               # 게임 시작
-    "Y": '',                # 미할당
+    "up": Key.up,
+    "down": Key.down,
+    "left": Key.left,
+    "right": Key.right,
+    "A": Key.space,
+    "B": Key.enter,
+    "X": '1',
+    "Y": '',
 }
 
-# 조이스틱 방향 키 세트 (성능 최적화: 반복 생성 방지)
 JOYSTICK_KEY_SET = {KEY_MAPPING["up"], KEY_MAPPING["down"], KEY_MAPPING["left"], KEY_MAPPING["right"]}
 
-# 조이스틱 임계값 (이 값 이상일 때만 키 입력)
-JOYSTICK_THRESHOLD = 0.3  # 30% 이상
+JOYSTICK_THRESHOLD = 0.3
+JOYSTICK_THRESHOLD_ON = 0.3
+JOYSTICK_THRESHOLD_OFF = 0.25
 
-# 조이스틱 히스테리시스 (떨림 방지)
-# 키를 누르기 시작하는 임계값과 떼는 임계값을 다르게 설정하여 떨림 방지
-JOYSTICK_THRESHOLD_ON = 0.3   # 키를 누르기 시작하는 임계값
-JOYSTICK_THRESHOLD_OFF = 0.25 # 키를 떼는 임계값 (더 낮게 설정하여 떨림 방지)
+INACTIVITY_RELEASE_TIMEOUT = 0.5
 
-# 입력 정지 타임아웃 (초)
-# 이 시간 동안 조이스틱/버튼 데이터가 안 들어오면 자동으로 모든 키를 뗀다
-# 안드로이드에서 데이터가 같으면 전송하지 않는 문제를 고려하여 시간 증가
-INACTIVITY_RELEASE_TIMEOUT = 0.5  # 0.5초로 증가 (안드로이드 데이터 전송 특성 고려)
+ENABLE_VERBOSE_LOGGING = False
 
-# 로깅 설정 (성능 최적화)
-ENABLE_VERBOSE_LOGGING = False  # True로 설정하면 상세 로그 출력
-
-# 접속자 정보 정리 설정
-USER_CLEANUP_TIMEOUT = 3600  # 1시간 (초 단위) - 이 시간 이상 비활성 접속자 제거
+USER_CLEANUP_TIMEOUT = 3600
 
 
 def resolve_server_port(cli_port=None):
-    """
-    CLI 인자나 환경 변수를 기반으로 사용할 포트를 결정한다.
-    우선순위: CLI > GAME_SERVER_PORT > PORT > 기본값.
-    """
     if cli_port is not None:
         return cli_port
 
@@ -154,17 +92,14 @@ def resolve_server_port(cli_port=None):
     return DEFAULT_SERVER_PORT
 
 def get_local_ip():
-    """로컬 네트워크 IP 주소 가져오기"""
     try:
-        # 외부 서버에 연결하지 않고 로컬 IP만 가져오기
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))  # Google DNS에 연결 시도 (실제 연결 안됨)
+        s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
         return ip
     except Exception:
         try:
-            # 대체 방법: 호스트 이름으로 IP 가져오기
             hostname = socket.gethostname()
             ip = socket.gethostbyname(hostname)
             return ip
@@ -172,17 +107,14 @@ def get_local_ip():
             return "127.0.0.1"
 
 def get_all_local_ips(use_cache=True):
-    """모든 로컬 네트워크 IP 주소 가져오기 (캐싱 지원)"""
     global _cached_server_ips
     
-    # 캐시된 값이 있으면 반환
     if use_cache and _cached_server_ips is not None:
         return _cached_server_ips
     
     ips = []
     try:
         hostname = socket.gethostname()
-        # 모든 IP 주소 가져오기
         for addr in socket.getaddrinfo(hostname, None):
             ip = addr[4][0]
             if ip and ip != '127.0.0.1' and not ip.startswith('::'):
@@ -191,21 +123,18 @@ def get_all_local_ips(use_cache=True):
     except Exception:
         pass
     
-    # 기본 방법으로도 시도
     main_ip = get_local_ip()
     if main_ip and main_ip not in ips:
         ips.insert(0, main_ip)
     
     result = ips if ips else ["127.0.0.1"]
     
-    # 캐시에 저장
     if use_cache:
         _cached_server_ips = result
     
     return result
 
 def update_user_activity():
-    """접속자 활동 정보 업데이트"""
     ip = request.remote_addr
     now = datetime.now()
     
@@ -220,7 +149,6 @@ def update_user_activity():
     connected_users[ip]["request_count"] += 1
 
 def cleanup_inactive_users():
-    """오래된 접속자 정보 정리 (메모리 최적화)"""
     now = datetime.now()
     inactive_ips = []
     
@@ -229,7 +157,6 @@ def cleanup_inactive_users():
         if elapsed > USER_CLEANUP_TIMEOUT:
             inactive_ips.append(ip)
     
-    # 비활성 접속자 제거
     for ip in inactive_ips:
         del connected_users[ip]
     
@@ -238,8 +165,6 @@ def cleanup_inactive_users():
 
 @app.route('/', methods=['GET'])
 def dashboard():
-    """메인 대시보드 HTML 페이지"""
-    # 서버 IP 주소를 미리 가져와서 템플릿에 삽입 (성능 최적화)
     server_ips = get_all_local_ips()
     server_port = app.config.get("SERVER_PORT", DEFAULT_SERVER_PORT)
     ip_links_html = ', '.join([
@@ -260,8 +185,6 @@ def dashboard():
 
 @app.route('/users', methods=['GET'])
 def get_users():
-    """접속자 목록 반환"""
-    # 비활성 접속자 정리 (최적화)
     cleanup_inactive_users()
     
     now = datetime.now()
@@ -277,7 +200,6 @@ def get_users():
             "elapsed_seconds": round(elapsed, 2)
         })
     
-    # 마지막 활동 시간 순으로 정렬
     users_list.sort(key=lambda x: x["last_seen"], reverse=True)
     
     return jsonify({
@@ -288,7 +210,6 @@ def get_users():
 
 @app.route('/ping', methods=['GET'])
 def ping():
-    """서버 연결 테스트"""
     update_user_activity()
     return jsonify({
         "status": "ok",
@@ -298,11 +219,9 @@ def ping():
 
 @app.route('/status', methods=['GET'])
 def get_status():
-    """서버 상태 및 데이터 수신 통계 확인"""
     update_user_activity()
     now = datetime.now()
     
-    # 마지막 수신으로부터 경과 시간 계산
     joystick_elapsed = None
     button_elapsed = None
     
@@ -312,11 +231,9 @@ def get_status():
     if stats["last_button_time"]:
         button_elapsed = (now - stats["last_button_time"]).total_seconds()
     
-    # 데이터 수신 여부 판단 (5초 이내면 활성)
     joystick_active = joystick_elapsed is not None and joystick_elapsed < 5.0
     button_active = button_elapsed is not None and button_elapsed < 5.0
     
-    # 서버 IP 주소 가져오기 (캐시 사용)
     server_ips = get_all_local_ips(use_cache=True)
     
     return jsonify({
@@ -350,79 +267,57 @@ def get_status():
     })
 
 def calculate_joystick_keys(x, y):
-    """
-    조이스틱 입력값(x, y)을 키 매핑으로 변환 (히스테리시스 적용)
+    target_keys = set()
+    keys_to_press = []
+    is_active = False
     
-    Args:
-        x: 조이스틱 X 좌표 (-1.0 ~ 1.0)
-        y: 조이스틱 Y 좌표 (-1.0 ~ 1.0)
-    
-    Returns:
-        tuple: (target_keys: set, keys_to_press: list, is_active: bool)
-    """
-    target_keys = set()  # 눌려야 할 키 집합
-    keys_to_press = []  # 눌려야 할 키 이름 리스트
-    is_active = False  # 조이스틱이 활성 상태인지
-    
-    # 이전에 활성화된 키들 가져오기
     previous_active_keys = last_joystick_state.get("active_keys", set())
     
-    # 히스테리시스 적용: 키를 누르기 시작할 때는 높은 임계값, 떼기 시작할 때는 낮은 임계값 사용
-    # 위/아래 방향
     up_was_active = KEY_MAPPING["up"] in previous_active_keys
     down_was_active = KEY_MAPPING["down"] in previous_active_keys
     
     if up_was_active:
-        # 위 키가 이미 눌려있었으면 낮은 임계값으로 유지 (떨림 방지)
         if y > JOYSTICK_THRESHOLD_OFF:
             target_keys.add(KEY_MAPPING["up"])
             keys_to_press.append("up")
             is_active = True
     else:
-        # 위 키가 눌려있지 않았으면 높은 임계값으로 시작
         if y > JOYSTICK_THRESHOLD_ON:
             target_keys.add(KEY_MAPPING["up"])
             keys_to_press.append("up")
             is_active = True
     
     if down_was_active:
-        # 아래 키가 이미 눌려있었으면 낮은 임계값으로 유지 (떨림 방지)
         if y < -JOYSTICK_THRESHOLD_OFF:
             target_keys.add(KEY_MAPPING["down"])
             keys_to_press.append("down")
             is_active = True
     else:
-        # 아래 키가 눌려있지 않았으면 높은 임계값으로 시작
         if y < -JOYSTICK_THRESHOLD_ON:
             target_keys.add(KEY_MAPPING["down"])
             keys_to_press.append("down")
             is_active = True
     
-    # 좌/우 방향
     right_was_active = KEY_MAPPING["right"] in previous_active_keys
     left_was_active = KEY_MAPPING["left"] in previous_active_keys
     
     if right_was_active:
-        # 오른쪽 키가 이미 눌려있었으면 낮은 임계값으로 유지 (떨림 방지)
         if x > JOYSTICK_THRESHOLD_OFF:
             target_keys.add(KEY_MAPPING["right"])
             keys_to_press.append("right")
             is_active = True
     else:
-        # 오른쪽 키가 눌려있지 않았으면 높은 임계값으로 시작
         if x > JOYSTICK_THRESHOLD_ON:
             target_keys.add(KEY_MAPPING["right"])
             keys_to_press.append("right")
             is_active = True
     
     if left_was_active:
-        # 왼쪽 키가 이미 눌려있었으면 낮은 임계값으로 유지 (떨림 방지)
         if x < -JOYSTICK_THRESHOLD_OFF:
             target_keys.add(KEY_MAPPING["left"])
             keys_to_press.append("left")
             is_active = True
     else:
-        # 왼쪽 키가 눌려있지 않았으면 높은 임계값으로 시작
         if x < -JOYSTICK_THRESHOLD_ON:
             target_keys.add(KEY_MAPPING["left"])
             keys_to_press.append("left")
@@ -432,21 +327,11 @@ def calculate_joystick_keys(x, y):
 
 
 def process_joystick_keys(target_keys):
-    """
-    조이스틱 키 입력 처리 (press/release)
-    버튼과 조이스틱 키를 분리하여 추적하여 간섭 방지
-    
-    Args:
-        target_keys: 눌려야 할 키 집합
-    """
     global pressed_joystick_keys, pressed_keyboard_keys, pressed_button_keys
     
     with keyboard_lock:
-        # 조이스틱으로 눌려야 하는 키 (조이스틱 방향 키만)
         target_joystick_keys = target_keys & JOYSTICK_KEY_SET
         
-        # 조이스틱으로 눌려야 하는데 안 눌려있는 키 → 누르기
-        # 버튼이 이미 눌려있는 키는 물리적으로 누르지 않지만, 조이스틱 추적에는 포함
         keys_to_add_physically = target_joystick_keys - pressed_keyboard_keys - pressed_button_keys
         for key in keys_to_add_physically:
             try:
@@ -457,35 +342,24 @@ def process_joystick_keys(target_keys):
                 if ENABLE_VERBOSE_LOGGING:
                     print(f"Error pressing key {key}: {e}")
         
-        # 이미 눌려있지만 조이스틱 추적에 없는 키 추가 (버튼을 떼고 난 후 조이스틱이 계속 같은 방향일 때)
-        # 버튼이 눌려있지 않고, 키가 이미 눌려있고, 조이스틱이 이 키를 눌러야 하면 추적에 추가
         keys_already_pressed = (target_joystick_keys & pressed_keyboard_keys) - pressed_button_keys - pressed_joystick_keys
         for key in keys_already_pressed:
-            # 조이스틱 추적에 추가 (물리적으로는 이미 눌려있음)
             pressed_joystick_keys.add(key)
             if ENABLE_VERBOSE_LOGGING:
                 print(f"[Key] Joystick takes over already pressed key: {key}")
         
-        # 이미 눌려있고 조이스틱 추적에도 있는 키는 유지 (키가 지속적으로 눌려있도록 보장)
-        # 키가 이미 눌려있고 조이스틱이 이 키를 눌러야 하면, 주기적으로 다시 눌러서 지속성 보장
         keys_to_maintain = target_joystick_keys & pressed_joystick_keys & pressed_keyboard_keys
         for key in keys_to_maintain:
-            # 키가 이미 눌려있지만, 지속성을 위해 주기적으로 다시 누르기
-            # 일부 시스템에서는 키가 자동으로 해제될 수 있으므로 주기적으로 다시 눌러야 함
             try:
-                # 키를 release 후 press하여 지속성 보장 (더 확실한 방법)
                 keyboard.release(key)
-                time.sleep(0.001)  # 매우 짧은 딜레이
+                time.sleep(0.001)
                 keyboard.press(key)
             except Exception as e:
                 if ENABLE_VERBOSE_LOGGING:
                     print(f"Error maintaining key {key}: {e}")
         
-        # 조이스틱으로 눌려있는데 뗴야 하는 키 → 떼기
-        # 버튼이 눌려있는 키는 건드리지 않음
         keys_to_remove = (pressed_joystick_keys & JOYSTICK_KEY_SET) - target_joystick_keys
         for key in keys_to_remove:
-            # 버튼이 이 키를 사용 중이면 건드리지 않음
             if key not in pressed_button_keys:
                 try:
                     keyboard.release(key)
@@ -495,26 +369,13 @@ def process_joystick_keys(target_keys):
                     if ENABLE_VERBOSE_LOGGING:
                         print(f"Error releasing key {key}: {e}")
             else:
-                # 버튼이 사용 중이면 조이스틱 추적에서만 제거 (물리적 키는 유지)
                 pressed_joystick_keys.discard(key)
         
-        # 조이스틱 키 추적 업데이트 (버튼과 분리)
-        # 조이스틱 키만 유지하고 새로운 키 추가
-        pressed_joystick_keys &= JOYSTICK_KEY_SET  # 조이스틱 키만 유지
-        pressed_joystick_keys |= target_joystick_keys  # 새로운 조이스틱 키 추가 (버튼이 눌러도 추적)
+        pressed_joystick_keys &= JOYSTICK_KEY_SET
+        pressed_joystick_keys |= target_joystick_keys
 
 
 def process_joystick_data_internal(data, source="HTTP"):
-    """
-    조이스틱 데이터 처리 공통 함수 (HTTP/MQTT 공통)
-    
-    Args:
-        data: 조이스틱 데이터 딕셔너리 {"x": float, "y": float, "strength": int, "reset": bool}
-        source: 데이터 출처 ("HTTP" 또는 "MQTT")
-    
-    Returns:
-        dict: 처리 결과
-    """
     global pressed_joystick_keys, pressed_keyboard_keys, pressed_button_keys
     
     try:
@@ -523,7 +384,6 @@ def process_joystick_data_internal(data, source="HTTP"):
         strength = data.get('strength', 0)
         reset_requested = data.get('reset', False)
         
-        # 데이터 타입 검증
         try:
             x = float(x)
             y = float(y)
@@ -532,31 +392,25 @@ def process_joystick_data_internal(data, source="HTTP"):
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [Joystick/{source}] ⚠️ 에러: {error_msg}")
             return {"status": "error", "message": error_msg}
         
-        # 게임 재시작 요청이 있으면 상태 초기화
         if reset_requested:
             reset_all_states_internal()
             if ENABLE_VERBOSE_LOGGING:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] [Joystick/{source}] 게임 재시작 - 상태 초기화됨")
         
-        # 통계 업데이트
         stats["joystick_count"] += 1
         now = datetime.now()
         stats["last_joystick_time"] = now
         
-        # 조이스틱 입력값을 키 매핑으로 변환 (히스테리시스 적용)
         target_keys, keys_to_press, is_active = calculate_joystick_keys(x, y)
         
-        # 마지막 조이스틱 상태 저장
         last_joystick_state["x"] = x
         last_joystick_state["y"] = y
         last_joystick_state["keys"] = target_keys.copy()
         last_joystick_state["is_active"] = is_active
         last_joystick_state["active_keys"] = target_keys.copy()
         
-        # 조이스틱 키 입력 처리 (press/release)
         process_joystick_keys(target_keys)
         
-        # 최근 데이터 저장
         recent_data["last_joystick"] = {
             "x": round(x, 2),
             "y": round(y, 2),
@@ -587,29 +441,17 @@ def process_joystick_data_internal(data, source="HTTP"):
 
 
 def process_button_data_internal(data, source="HTTP"):
-    """
-    버튼 데이터 처리 공통 함수 (HTTP/MQTT 공통)
-    
-    Args:
-        data: 버튼 데이터 딕셔너리 {"button": str, "pressed": bool}
-        source: 데이터 출처 ("HTTP" 또는 "MQTT")
-    
-    Returns:
-        dict: 처리 결과
-    """
     global pressed_joystick_keys, pressed_button_keys, pressed_keyboard_keys, pressed_keys
     
     try:
         button = data.get('button', '')
         pressed = data.get('pressed', False)
         
-        # 버튼 이름 검증
         if not button:
             error_msg = "Button name is required"
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [Button/{source}] ⚠️ 에러: {error_msg}")
             return {"status": "error", "message": error_msg}
         
-        # 통계 업데이트
         stats["button_count"] += 1
         now = datetime.now()
         stats["last_button_time"] = now
@@ -622,14 +464,11 @@ def process_button_data_internal(data, source="HTTP"):
         key = KEY_MAPPING[button]
         action = "pressed" if pressed else "released"
         
-        # 빈 키 매핑 체크
         if not key:
             return {"status": "ok", "message": f"Button {button} has no key mapping"}
         
-        # 이전 버튼 상태 확인 (중복 처리 방지)
         previous_state = last_button_states.get(button, {}).get("pressed", False)
         
-        # 상태가 변경되지 않았으면 처리하지 않음
         if previous_state == pressed:
             return {
                 "status": "ok",
@@ -640,14 +479,12 @@ def process_button_data_internal(data, source="HTTP"):
                 "message": "State unchanged, skipped"
             }
         
-        # 마지막 버튼 상태 저장
         last_button_states[button] = {
             "pressed": pressed,
             "key": key,
             "time": now
         }
         
-        # 상태가 변경되었을 때만 키 입력 처리
         if pressed:
             if button not in pressed_keys:
                 with keyboard_lock:
@@ -717,7 +554,6 @@ def process_button_data_internal(data, source="HTTP"):
             if button in last_button_states:
                 del last_button_states[button]
         
-        # 최근 데이터 저장
         recent_data["last_button"] = {
             "button": button,
             "pressed": pressed,
@@ -750,45 +586,24 @@ def process_button_data_internal(data, source="HTTP"):
 
 @app.route('/joystick', methods=['POST', 'OPTIONS'])
 def receive_joystick():
-    """
-    조이스틱 데이터를 키보드 입력으로 변환 (최적화: 차등 처리)
-    
-    받는 데이터:
-    {
-        "x": 0.53,    # -1.0 ~ 1.0 (좌우)
-        "y": 0.53,   # -1.0 ~ 1.0 (앞뒤)
-        "strength": 75
-    }
-    
-    변환:
-    - y > 0.3  → 위쪽 키 (W 또는 ↑)
-    - y < -0.3 → 아래쪽 키 (S 또는 ↓)
-    - x > 0.3  → 오른쪽 키 (D 또는 →)
-    - x < -0.3 → 왼쪽 키 (A 또는 ←)
-    """
-    # OPTIONS 요청 처리 (CORS preflight)
     if request.method == 'OPTIONS':
         return jsonify({"status": "ok"}), 200
     
-    # 전역 변수 사용 선언 (함수 시작 부분에 위치)
     global pressed_joystick_keys, pressed_keyboard_keys, pressed_button_keys
     
     try:
         update_user_activity()
         
-        # Content-Type 확인
         if not request.is_json:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [Joystick] ⚠️ 400 에러: Content-Type이 application/json이 아닙니다. Content-Type: {request.content_type}")
             return jsonify({"status": "error", "message": "Content-Type must be application/json"}), 400
         
         data = request.get_json()
         
-        # 데이터 유효성 검사
         if data is None:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [Joystick] ⚠️ 400 에러: JSON 데이터가 없습니다")
             return jsonify({"status": "error", "message": "No JSON data provided"}), 400
         
-        # 공통 처리 함수 호출
         result = process_joystick_data_internal(data, source="HTTP")
         
         if result["status"] == "error":
@@ -806,38 +621,24 @@ def receive_joystick():
 
 @app.route('/button', methods=['POST', 'OPTIONS'])
 def receive_button():
-    """
-    버튼 데이터를 키보드 입력으로 변환
-    
-    받는 데이터:
-    {
-        "button": "A",      # "A", "B", "X", "Y"
-        "pressed": true     # true = 눌림, false = 떼어짐
-    }
-    """
-    # OPTIONS 요청 처리 (CORS preflight)
     if request.method == 'OPTIONS':
         return jsonify({"status": "ok"}), 200
     
-    # 전역 변수 사용 선언 (함수 시작 부분에 위치)
     global pressed_joystick_keys, pressed_button_keys, pressed_keyboard_keys, pressed_keys
     
     try:
         update_user_activity()
         
-        # Content-Type 확인
         if not request.is_json:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [Button] ⚠️ 400 에러: Content-Type이 application/json이 아닙니다. Content-Type: {request.content_type}")
             return jsonify({"status": "error", "message": "Content-Type must be application/json"}), 400
         
         data = request.get_json()
         
-        # 데이터 유효성 검사
         if data is None:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [Button] ⚠️ 400 에러: JSON 데이터가 없습니다")
             return jsonify({"status": "error", "message": "No JSON data provided"}), 400
         
-        # 공통 처리 함수 호출
         result = process_button_data_internal(data, source="HTTP")
         
         if result["status"] == "error":
@@ -855,33 +656,21 @@ def receive_button():
 
 @app.route('/stop', methods=['POST'])
 def stop_all():
-    """모든 키 입력 중지"""
     release_all_keys()
     return jsonify({"status": "ok", "message": "All keys released"})
 
 @app.route('/reset', methods=['POST'])
 def reset_all_states():
-    """
-    모든 상태 초기화 (게임 재시작 시 사용)
-    키 상태, 조이스틱 상태, 버튼 상태 모두 초기화
-    """
     try:
-        # 모든 키 해제
         release_all_keys()
         
-        # 조이스틱 상태 초기화
         last_joystick_state["x"] = 0.0
         last_joystick_state["y"] = 0.0
         last_joystick_state["keys"] = set()
         last_joystick_state["is_active"] = False
         last_joystick_state["active_keys"] = set()
         
-        # 버튼 상태 초기화
         last_button_states.clear()
-        
-        # 통계는 유지 (선택사항)
-        # stats["joystick_count"] = 0
-        # stats["button_count"] = 0
         
         if ENABLE_VERBOSE_LOGGING:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [Reset] 모든 상태 초기화됨")
@@ -895,12 +684,8 @@ def reset_all_states():
 
 @app.route('/config', methods=['POST'])
 def update_key_mapping():
-    """키 매핑 설정 변경"""
     try:
         data = request.get_json()
-        
-        # 예시: {"A": "space", "B": "shift"}
-        # 실제 구현 시 키 문자열을 Key 객체로 변환 필요
         return jsonify({
             "status": "ok",
             "message": "Key mapping updated"
@@ -909,11 +694,9 @@ def update_key_mapping():
         return jsonify({"status": "error", "message": str(e)}), 400
 
 def press_key(key):
-    """키보드 키 누르기 (동기화 처리로 끊김 방지, 중복 방지)"""
-    global pressed_keyboard_keys  # 전역 변수 사용 선언
+    global pressed_keyboard_keys
     try:
         with keyboard_lock:
-            # 키가 이미 눌려있지 않으면 누르기 (중복 방지)
             if key not in pressed_keyboard_keys:
                 keyboard.press(key)
                 pressed_keyboard_keys.add(key)
@@ -924,11 +707,9 @@ def press_key(key):
             print(f"Error pressing key {key}: {e}")
 
 def release_key(key):
-    """키보드 키 떼기 (동기화 처리로 끊김 방지, 확실한 해제 보장)"""
-    global pressed_keyboard_keys  # 전역 변수 사용 선언
+    global pressed_keyboard_keys
     try:
         with keyboard_lock:
-            # 키가 눌려있으면 떼기 (확실한 해제 보장)
             if key in pressed_keyboard_keys:
                 keyboard.release(key)
                 pressed_keyboard_keys.discard(key)
@@ -939,11 +720,9 @@ def release_key(key):
             print(f"Error releasing key {key}: {e}")
 
 def release_all_keys():
-    """모든 키보드 키 떼기 (동기화 처리로 끊김 방지)"""
-    global pressed_joystick_keys, pressed_button_keys, pressed_keyboard_keys, pressed_keys  # 전역 변수 사용 선언
+    global pressed_joystick_keys, pressed_button_keys, pressed_keyboard_keys, pressed_keys
     try:
         with keyboard_lock:
-            # 현재 눌려있는 모든 키보드 키를 떼기
             keys_to_release = list(pressed_keyboard_keys)
             for key in keys_to_release:
                 try:
@@ -953,7 +732,6 @@ def release_all_keys():
                         print(f"Error releasing key {key}: {e}")
             pressed_keyboard_keys.clear()
             
-            # 버튼 및 조이스틱 추적도 초기화
             pressed_keys.clear()
             pressed_button_keys.clear()
             pressed_joystick_keys.clear()
@@ -962,72 +740,48 @@ def release_all_keys():
             print(f"Error releasing all keys: {e}")
 
 def reset_all_states_internal():
-    """
-    내부 상태 초기화 함수 (게임 재시작 시 사용)
-    """
-    global pressed_joystick_keys, pressed_button_keys  # 전역 변수 사용 선언
-    # 모든 키 해제
+    global pressed_joystick_keys, pressed_button_keys
     release_all_keys()
     
-    # 조이스틱 상태 초기화
     last_joystick_state["x"] = 0.0
     last_joystick_state["y"] = 0.0
     last_joystick_state["keys"] = set()
     last_joystick_state["is_active"] = False
     last_joystick_state["active_keys"] = set()
     
-    # 버튼 상태 초기화
     last_button_states.clear()
     
-    # 키 추적 초기화
     with keyboard_lock:
         pressed_button_keys.clear()
         pressed_joystick_keys.clear()
 
 
 def input_watchdog_loop():
-    """
-    조이스틱/버튼 입력이 일정 시간 동안 안 들어오면
-    자동으로 모든 키를 떼는 감시 루프.
-    안드로이드에서 데이터가 같으면 전송하지 않는 문제를 고려하여 개선됨.
-    조이스틱이 활성 상태일 때는 이전 입력을 지속합니다.
-    """
     while True:
         try:
             now = datetime.now()
             should_release = False
 
-            # 조이스틱 입력 타임아웃 체크
             if stats["last_joystick_time"] is not None:
                 elapsed_js = (now - stats["last_joystick_time"]).total_seconds()
                 
-                # 조이스틱이 활성 상태일 때는 이전 입력을 지속
                 if last_joystick_state.get("is_active", False):
-                    # 조이스틱이 활성 상태이면 마지막 상태를 유지하기 위해 주기적으로 다시 적용
-                    # INACTIVITY_RELEASE_TIMEOUT 이후부터 주기적으로 상태 유지
                     if elapsed_js > INACTIVITY_RELEASE_TIMEOUT:
-                        # 마지막 조이스틱 상태를 다시 적용하여 키 유지
                         target_keys = last_joystick_state.get("active_keys", set())
                         if target_keys:
                             process_joystick_keys(target_keys)
                             if ENABLE_VERBOSE_LOGGING:
                                 print(f"[Watchdog] 조이스틱 이전 입력 지속: {target_keys}")
-                    # 매우 긴 타임아웃(10초)이 지나면 해제 (연결 끊김으로 간주)
                     if elapsed_js > 10.0:
                         should_release = True
                 else:
-                    # 조이스틱이 중앙 상태였으면 타임아웃 후 해제
                     if elapsed_js > INACTIVITY_RELEASE_TIMEOUT:
                         should_release = True
 
-            # 버튼 입력 타임아웃 체크 (안드로이드 데이터 전송 특성 고려)
             if stats["last_button_time"] is not None:
                 elapsed_btn = (now - stats["last_button_time"]).total_seconds()
-                # 버튼이 눌린 상태였으면 더 긴 타임아웃 적용 (안드로이드에서 같은 데이터를 보내지 않아도 유지)
                 if last_button_states:
-                    # 눌린 버튼이 있으면 더 긴 타임아웃 (1.5초)
                     if elapsed_btn > INACTIVITY_RELEASE_TIMEOUT * 3:
-                        # 버튼 키 해제
                         with keyboard_lock:
                             for button_name, btn_state in list(last_button_states.items()):
                                 if btn_state["pressed"]:
@@ -1040,16 +794,11 @@ def input_watchdog_loop():
                                             print(f"Error releasing button key {button_name}: {e}")
                                     del last_button_states[button_name]
                 else:
-                    # 눌린 버튼이 없으면 일반 타임아웃
                     if elapsed_btn > INACTIVITY_RELEASE_TIMEOUT:
                         should_release = True
 
-            # 일정 시간 동안 입력이 없는데 아직 키가 눌려있으면 해제
-            # 단, 조이스틱이 활성 상태였고 타임아웃이 짧으면 유지 (안드로이드 데이터 전송 특성 고려)
             if should_release and pressed_keyboard_keys:
-                # 조이스틱 방향 키만 선택적으로 해제 (버튼 키는 제외)
                 with keyboard_lock:
-                    # 버튼 키는 제외하고 조이스틱 키만 해제
                     button_keys = {btn_state["key"] for btn_state in last_button_states.values() if btn_state["pressed"]}
                     keys_to_release = list((pressed_keyboard_keys & JOYSTICK_KEY_SET) - button_keys)
                     for key in keys_to_release:
@@ -1064,204 +813,7 @@ def input_watchdog_loop():
             if ENABLE_VERBOSE_LOGGING:
                 print(f"Error in input watchdog loop: {e}")
 
-        # 너무 자주 돌지 않도록 약간 딜레이
         time.sleep(0.05)
-
-
-# ==================== MQTT 관련 함수 ====================
-
-def on_mqtt_connect(client, userdata, flags, rc):
-    """MQTT 연결 콜백"""
-    global mqtt_connected
-    if rc == 0:
-        mqtt_connected = True
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [MQTT] ✓ 브로커에 연결되었습니다 ({MQTT_BROKER_HOST}:{MQTT_BROKER_PORT})")
-        
-        # 토픽 구독
-        joystick_topic = f"{MQTT_TOPIC_PREFIX}/joystick"
-        button_topic = f"{MQTT_TOPIC_PREFIX}/button"
-        status_topic = f"{MQTT_TOPIC_PREFIX}/status"
-        
-        client.subscribe(joystick_topic)
-        client.subscribe(button_topic)
-        client.subscribe(status_topic)
-        
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [MQTT] 토픽 구독: {joystick_topic}, {button_topic}, {status_topic}")
-        
-        # 연결 성공 메시지 발행
-        publish_mqtt_status({"status": "connected", "message": "MQTT 연결 성공"})
-    else:
-        mqtt_connected = False
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [MQTT] ⚠️ 연결 실패: 코드 {rc}")
-
-
-def on_mqtt_disconnect(client, userdata, rc):
-    """MQTT 연결 끊김 콜백"""
-    global mqtt_connected
-    mqtt_connected = False
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] [MQTT] ⚠️ 브로커 연결이 끊어졌습니다")
-
-
-def on_mqtt_message(client, userdata, msg):
-    """MQTT 메시지 수신 콜백"""
-    try:
-        topic = msg.topic
-        payload = msg.payload.decode('utf-8')
-        
-        # JSON 파싱
-        try:
-            data = json.loads(payload)
-        except json.JSONDecodeError:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [MQTT] ⚠️ 잘못된 JSON 형식: {payload}")
-            return
-        
-        # 토픽에 따라 처리
-        if topic.endswith("/joystick"):
-            process_joystick_data_internal(data, source="MQTT")
-        elif topic.endswith("/button"):
-            process_button_data_internal(data, source="MQTT")
-        elif topic.endswith("/status"):
-            # 상태 요청에 응답 (MQTT 상태 발행 루프와 동일한 방식으로 처리)
-            pass  # 상태는 주기적으로 자동 발행되므로 여기서는 처리하지 않음
-        
-    except Exception as e:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [MQTT] ⚠️ 메시지 처리 에러: {e}")
-        import traceback
-        if ENABLE_VERBOSE_LOGGING:
-            traceback.print_exc()
-
-
-def publish_mqtt_status(status_data):
-    """서버 상태를 MQTT로 발행"""
-    global mqtt_client, mqtt_connected
-    
-    if not MQTT_AVAILABLE or not MQTT_ENABLED:
-        return
-    
-    if mqtt_client is None or not mqtt_connected:
-        return
-    
-    try:
-        topic = f"{MQTT_TOPIC_PREFIX}/status"
-        payload = json.dumps(status_data, ensure_ascii=False)
-        mqtt_client.publish(topic, payload, qos=1, retain=False)
-    except Exception as e:
-        if ENABLE_VERBOSE_LOGGING:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [MQTT] ⚠️ 상태 발행 에러: {e}")
-
-
-def init_mqtt_client():
-    """MQTT 클라이언트 초기화 및 연결"""
-    global mqtt_client, mqtt_connected
-    
-    if not MQTT_AVAILABLE:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [MQTT] ⚠️ paho-mqtt가 설치되지 않아 MQTT 기능을 사용할 수 없습니다")
-        return False
-    
-    if not MQTT_ENABLED:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [MQTT] ℹ️ MQTT가 비활성화되어 있습니다 (MQTT_ENABLED=false)")
-        return False
-    
-    try:
-        # MQTT 클라이언트 생성
-        mqtt_client = mqtt.Client(client_id=MQTT_CLIENT_ID)
-        
-        # 인증 설정
-        if MQTT_USERNAME and MQTT_PASSWORD:
-            mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-        
-        # 콜백 설정
-        mqtt_client.on_connect = on_mqtt_connect
-        mqtt_client.on_disconnect = on_mqtt_disconnect
-        mqtt_client.on_message = on_mqtt_message
-        
-        # 연결 시도
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [MQTT] 브로커에 연결 중... ({MQTT_BROKER_HOST}:{MQTT_BROKER_PORT})")
-        
-        try:
-            mqtt_client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, keepalive=60)
-            mqtt_client.loop_start()  # 백그라운드 스레드에서 루프 실행
-            
-            # 연결 확인을 위해 잠시 대기
-            time.sleep(1)
-            
-            if mqtt_connected:
-                return True
-            else:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] [MQTT] ⚠️ 브로커 연결 실패 (mosquitto가 실행 중인지 확인하세요)")
-                return False
-                
-        except Exception as e:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [MQTT] ⚠️ 브로커 연결 에러: {e}")
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [MQTT] 💡 mosquitto 브로커가 실행 중인지 확인하세요")
-            return False
-            
-    except Exception as e:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [MQTT] ⚠️ 초기화 에러: {e}")
-        return False
-
-
-def mqtt_status_publisher_loop():
-    """주기적으로 서버 상태를 MQTT로 발행하는 루프"""
-    while True:
-        try:
-            if mqtt_connected:
-                # 서버 상태 가져오기 (Flask 컨텍스트 없이 직접 데이터 구성)
-                now = datetime.now()
-                
-                # 마지막 수신으로부터 경과 시간 계산
-                joystick_elapsed = None
-                button_elapsed = None
-                
-                if stats["last_joystick_time"]:
-                    joystick_elapsed = (now - stats["last_joystick_time"]).total_seconds()
-                
-                if stats["last_button_time"]:
-                    button_elapsed = (now - stats["last_button_time"]).total_seconds()
-                
-                joystick_active = joystick_elapsed is not None and joystick_elapsed < 5.0
-                button_active = button_elapsed is not None and button_elapsed < 5.0
-                
-                server_ips = get_all_local_ips(use_cache=True)
-                
-                status_data = {
-                    "status": "ok",
-                    "server_running": True,
-                    "server_start_time": stats["server_start_time"].isoformat(),
-                    "current_time": now.isoformat(),
-                    "server_ips": server_ips,
-                    "statistics": {
-                        "joystick": {
-                            "total_received": stats["joystick_count"],
-                            "last_received": stats["last_joystick_time"].isoformat() if stats["last_joystick_time"] else None,
-                            "elapsed_seconds": round(joystick_elapsed, 2) if joystick_elapsed is not None else None,
-                            "is_active": joystick_active
-                        },
-                        "button": {
-                            "total_received": stats["button_count"],
-                            "last_received": stats["last_button_time"].isoformat() if stats["last_button_time"] else None,
-                            "elapsed_seconds": round(button_elapsed, 2) if button_elapsed is not None else None,
-                            "is_active": button_active
-                        }
-                    },
-                    "recent_data": {
-                        "joystick": recent_data["last_joystick"],
-                        "button": recent_data["last_button"]
-                    },
-                    "summary": {
-                        "receiving_data": joystick_active or button_active,
-                        "message": "데이터 수신 중" if (joystick_active or button_active) else "데이터 수신 대기 중"
-                    },
-                    "mqtt_connected": mqtt_connected
-                }
-                
-                publish_mqtt_status(status_data)
-        except Exception as e:
-            if ENABLE_VERBOSE_LOGGING:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] [MQTT] 상태 발행 루프 에러: {e}")
-        
-        # 5초마다 상태 발행
-        time.sleep(5)
 
 
 if __name__ == '__main__':
@@ -1276,7 +828,6 @@ if __name__ == '__main__':
     server_port = resolve_server_port(args.port)
     app.config["SERVER_PORT"] = server_port
 
-    # 로컬 IP 주소 가져오기
     local_ips = get_all_local_ips()
     main_ip = local_ips[0] if local_ips else "127.0.0.1"
 
@@ -1330,37 +881,15 @@ if __name__ == '__main__':
     print(f"    3. 포트 선택 > TCP > 특정 로컬 포트: {server_port}")
     print("    4. 연결 허용 > 모든 프로필 > 이름: Flask Server")
     print("=" * 60)
-    print("MQTT 설정:")
-    if MQTT_ENABLED and MQTT_AVAILABLE:
-        print(f"  브로커: {MQTT_BROKER_HOST}:{MQTT_BROKER_PORT}")
-        print(f"  토픽 접두사: {MQTT_TOPIC_PREFIX}")
-        print(f"  발행 토픽: {MQTT_TOPIC_PREFIX}/status")
-        print(f"  구독 토픽: {MQTT_TOPIC_PREFIX}/joystick, {MQTT_TOPIC_PREFIX}/button")
-    else:
-        print("  MQTT: 비활성화됨")
-    print("=" * 60)
     print("⚠️  주의: 게임 창이 포커스되어 있어야 키 입력이 전달됩니다")
     print("=" * 60)
 
-    # 입력 감시 쓰레드 시작 (조이스틱/버튼 데이터가 끊기면 자동으로 키 해제)
     watchdog_thread = threading.Thread(target=input_watchdog_loop, daemon=True)
     watchdog_thread.start()
-    
-    # MQTT 클라이언트 초기화
-    if init_mqtt_client():
-        # MQTT 상태 발행 루프 시작
-        mqtt_status_thread = threading.Thread(target=mqtt_status_publisher_loop, daemon=True)
-        mqtt_status_thread.start()
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [MQTT] 상태 발행 루프 시작됨")
 
     try:
-        # 최적화된 서버 설정 (끊김 방지)
         app.run(host='0.0.0.0', port=server_port, debug=False, threaded=True, use_reloader=False)
     except KeyboardInterrupt:
         print("\n서버 종료 중...")
         release_all_keys()
-        # MQTT 연결 종료
-        if mqtt_client:
-            mqtt_client.loop_stop()
-            mqtt_client.disconnect()
         print("모든 키 입력 해제 완료")
